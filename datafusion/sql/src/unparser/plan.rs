@@ -1085,7 +1085,7 @@ impl Unparser<'_> {
     /// must be emitted as a derived subquery `(SELECT ...) AS alias`.
     ///
     /// Plans like Aggregate or Window build their own SELECT clauses (GROUP BY,
-    /// window functions). 
+    /// window functions).
     fn requires_derived_subquery(plan: &LogicalPlan) -> bool {
         matches!(
             plan,

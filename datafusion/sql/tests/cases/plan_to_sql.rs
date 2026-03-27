@@ -2916,7 +2916,10 @@ fn test_unparse_manual_join_with_subquery_aggregate() -> Result<()> {
     // Build the right side: SELECT max(j2_id) AS max_id FROM j2
     let right_scan = table_scan(Some("j2"), &j2_schema, None)?.build()?;
     let right_agg = LogicalPlanBuilder::from(right_scan)
-        .aggregate(vec![] as Vec<Expr>, vec![max(col("j2.j2_id")).alias("max_id")])?
+        .aggregate(
+            vec![] as Vec<Expr>,
+            vec![max(col("j2.j2_id")).alias("max_id")],
+        )?
         .build()?;
     let right_subquery = subquery_alias(right_agg, "b")?;
 
