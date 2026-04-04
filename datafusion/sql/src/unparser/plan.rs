@@ -829,17 +829,40 @@ impl Unparser<'_> {
                     select.already_projected(),
                 )?;
 
-                // If the SubqueryAlias directly wraps a plan that builds its
-                // own SELECT clauses (e.g. Aggregate adds GROUP BY, Window adds
+                // If the (possibly rewritten) inner plan builds its own
+                // SELECT clauses (e.g. Aggregate adds GROUP BY, Window adds
                 // OVER, etc.) and unparse_table_scan_pushdown couldn't reduce it,
                 // we must emit a derived subquery: (SELECT ...) AS alias.
                 // Without this, the recursive handler would merge those clauses
                 // into the outer SELECT, losing the subquery structure entirely.
-                if unparsed_table_scan.is_none()
-                    && Self::requires_derived_subquery(plan_alias.input.as_ref())
+                if unparsed_table_scan.is_none() && Self::requires_derived_subquery(plan)
                 {
+                    // When the dialect does not support column aliases in
+                    // table aliases (e.g. SQLite), inject the aliases into
+                    // the inner projection before wrapping as a derived
+                    // subquery.
+                    if !columns.is_empty()
+                        && !self.dialect.supports_column_alias_in_table_alias()
+                    {
+                        let Ok(rewritten_plan) =
+                            inject_column_aliases_into_subquery(plan.clone(), columns)
+                        else {
+                            return internal_err!(
+                                "Failed to transform SubqueryAlias plan"
+                            );
+                        };
+                        return self.derive(
+                            &rewritten_plan,
+                            relation,
+                            Some(self.new_table_alias(
+                                plan_alias.alias.table().to_string(),
+                                vec![],
+                            )),
+                            false,
+                        );
+                    }
                     return self.derive(
-                        &plan_alias.input,
+                        plan,
                         relation,
                         Some(self.new_table_alias(
                             plan_alias.alias.table().to_string(),

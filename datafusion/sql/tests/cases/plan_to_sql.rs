@@ -2894,6 +2894,20 @@ fn test_json_access_3() {
     );
 }
 
+/// Roundtrip test for a subquery aggregate with column aliases.
+/// Ensures that `subquery_alias_inner_query_and_columns` unwrapping
+/// a Projection -> Aggregate still triggers the derived-subquery path.
+#[test]
+fn roundtrip_subquery_aggregate_with_column_alias() -> Result<(), DataFusionError> {
+    roundtrip_statement_with_dialect_helper!(
+        sql: "SELECT id FROM (SELECT max(j1_id) FROM j1) AS c(id)",
+        parser_dialect: GenericDialect {},
+        unparser_dialect: UnparserDefaultDialect {},
+        expected: @"SELECT c.id FROM (SELECT max(j1.j1_id) FROM j1) AS c (id)",
+    );
+    Ok(())
+}
+
 /// Test that unparsing a manually constructed join with a subquery aggregate
 /// preserves the MAX aggregate function.
 ///
