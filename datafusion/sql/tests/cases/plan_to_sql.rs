@@ -2942,7 +2942,10 @@ fn roundtrip_aggregate_over_subquery() -> Result<(), DataFusionError> {
         .unwrap_or_else(|e| panic!("Failed to parse sql: {sql}\n{e}"));
 
     println!("Logical plan:\n{plan}");
-    println!("\nLogical plan (verbose):\n{}", plan.display_indent_schema());
+    println!(
+        "\nLogical plan (verbose):\n{}",
+        plan.display_indent_schema()
+    );
 
     let unparser = Unparser::new(&UnparserDefaultDialect {});
     let roundtrip_statement = unparser.plan_to_sql(&plan)?;
@@ -2995,7 +2998,59 @@ fn test_unparse_aggregate_over_subquery_no_inner_proj() -> Result<()> {
         .build()?;
 
     println!("Logical plan:\n{plan}");
-    println!("\nLogical plan (verbose):\n{}", plan.display_indent_schema());
+    println!(
+        "\nLogical plan (verbose):\n{}",
+        plan.display_indent_schema()
+    );
+
+    let unparser = Unparser::default();
+    let sql = unparser.plan_to_sql(&plan)?.to_string();
+    println!("\nUnparsed SQL:\n{sql}");
+
+    Ok(())
+}
+
+/// Same as test_unparse_aggregate_over_subquery_no_inner_proj but the outer
+/// Projection references the aggregate columns WITHOUT renaming them.
+/// The output column names should still match the Aggregate's aliases.
+///
+/// Plan shape:
+///   Projection: __agg_0, __agg_1
+///     Aggregate: aggr=[[max(bla.j1_rename) AS __agg_0, max(bla.j1_rename) AS __agg_1]]
+///       SubqueryAlias: bla
+///         Projection: j1.j1_id AS j1_rename
+///           TableScan: j1
+#[test]
+fn test_unparse_aggregate_no_outer_rename() -> Result<()> {
+    let context = MockContextProvider {
+        state: MockSessionState::default(),
+    };
+    let j1_schema = context
+        .get_table_source(TableReference::bare("j1"))?
+        .schema();
+
+    let scan = table_scan(Some("j1"), &j1_schema, None)?.build()?;
+    let inner_subquery = LogicalPlanBuilder::from(scan)
+        .project(vec![col("j1.j1_id").alias("j1_rename")])?
+        .alias("bla")?
+        .build()?;
+
+    let plan = LogicalPlanBuilder::from(inner_subquery)
+        .aggregate(
+            vec![] as Vec<Expr>,
+            vec![
+                max(col("bla.j1_rename")).alias("__agg_0"),
+                max(col("bla.j1_rename")).alias("__agg_1"),
+            ],
+        )?
+        .project(vec![col("__agg_0"), col("__agg_1")])?
+        .build()?;
+
+    println!("Logical plan:\n{plan}");
+    println!(
+        "\nLogical plan (verbose):\n{}",
+        plan.display_indent_schema()
+    );
 
     let unparser = Unparser::default();
     let sql = unparser.plan_to_sql(&plan)?.to_string();
