@@ -2919,52 +2919,21 @@ fn roundtrip_subquery_aggregate_with_column_alias() -> Result<(), DataFusionErro
     Ok(())
 }
 
-/// Roundtrip: aggregate over a subquery projection.
+/// Roundtrip: aggregate over a subquery projection with limit.
 #[test]
 fn roundtrip_aggregate_over_subquery() -> Result<(), DataFusionError> {
-    let sql = r#"SELECT __agg_0 AS "min(j1_id)", __agg_1 AS "max(j1_id)" FROM (SELECT min(j1_rename) AS __agg_0, max(j1_rename) AS __agg_1 FROM (SELECT j1_id AS j1_rename FROM j1) AS bla LIMIT 20)"#;
-
-    let statement = Parser::new(&GenericDialect {})
-        .try_with_sql(sql)?
-        .parse_statement()?;
-
-    let state = MockSessionState::default()
-        .with_aggregate_function(max_udaf())
-        .with_aggregate_function(min_udaf())
-        .with_expr_planner(Arc::new(CoreFunctionPlanner::default()))
-        .with_expr_planner(Arc::new(NestedFunctionPlanner))
-        .with_expr_planner(Arc::new(FieldAccessPlanner));
-
-    let context = MockContextProvider { state };
-    let sql_to_rel = SqlToRel::new(&context);
-    let plan = sql_to_rel
-        .sql_statement_to_plan(statement)
-        .unwrap_or_else(|e| panic!("Failed to parse sql: {sql}\n{e}"));
-
-    println!("Logical plan:\n{plan}");
-    println!(
-        "\nLogical plan (verbose):\n{}",
-        plan.display_indent_schema()
+    roundtrip_statement_with_dialect_helper!(
+        sql: r#"SELECT __agg_0 AS "min(j1_id)", __agg_1 AS "max(j1_id)" FROM (SELECT min(j1_rename) AS __agg_0, max(j1_rename) AS __agg_1 FROM (SELECT j1_id AS j1_rename FROM j1) AS bla LIMIT 20)"#,
+        parser_dialect: GenericDialect {},
+        unparser_dialect: UnparserDefaultDialect {},
+        expected: @r#"SELECT __agg_0 AS "min(j1_id)", __agg_1 AS "max(j1_id)" FROM (SELECT min(bla.j1_rename) AS __agg_0, max(bla.j1_rename) AS __agg_1 FROM (SELECT j1.j1_id AS j1_rename FROM j1) AS bla LIMIT 20)"#,
     );
-
-    let unparser = Unparser::new(&UnparserDefaultDialect {});
-    let roundtrip_statement = unparser.plan_to_sql(&plan)?;
-    let actual = &roundtrip_statement.to_string();
-
-    insta::assert_snapshot!(actual, @r#"SELECT __agg_0 AS "min(j1_id)", __agg_1 AS "max(j1_id)" FROM (SELECT min(bla.j1_rename) AS __agg_0, max(bla.j1_rename) AS __agg_1 FROM (SELECT j1.j1_id AS j1_rename FROM j1) AS bla LIMIT 20)"#);
     Ok(())
 }
 
-/// Same as roundtrip_aggregate_over_subquery but with the Projection between
-/// Limit and Aggregate removed — the aliases are inlined into the Aggregate.
-///
-/// Plan shape:
-///   Projection: __agg_0 AS "max1(j1_id)", __agg_1 AS "max2(j1_id)"
-///     Limit: fetch=20
-///       Aggregate: aggr=[[max(bla.j1_rename) AS __agg_0, max(bla.j1_rename) AS __agg_1]]
-///         SubqueryAlias: bla
-///           Projection: j1.j1_id AS j1_rename
-///             TableScan: j1
+/// Projection → Limit → Aggregate (aliases inlined into Aggregate, no
+/// intermediate Projection). Verifies the Limit is folded into the outer
+/// SELECT rather than creating a spurious derived subquery.
 #[test]
 fn test_unparse_aggregate_over_subquery_no_inner_proj() -> Result<()> {
     let context = MockContextProvider {
@@ -2974,15 +2943,10 @@ fn test_unparse_aggregate_over_subquery_no_inner_proj() -> Result<()> {
         .get_table_source(TableReference::bare("j1"))?
         .schema();
 
-    // (SELECT j1_id AS j1_rename FROM j1) AS bla
     let scan = table_scan(Some("j1"), &j1_schema, None)?.build()?;
-    let inner_subquery = LogicalPlanBuilder::from(scan)
+    let plan = LogicalPlanBuilder::from(scan)
         .project(vec![col("j1.j1_id").alias("j1_rename")])?
         .alias("bla")?
-        .build()?;
-
-    // Aggregate with aliases inlined (no separate Projection)
-    let plan = LogicalPlanBuilder::from(inner_subquery)
         .aggregate(
             vec![] as Vec<Expr>,
             vec![
@@ -2997,29 +2961,13 @@ fn test_unparse_aggregate_over_subquery_no_inner_proj() -> Result<()> {
         ])?
         .build()?;
 
-    println!("Logical plan:\n{plan}");
-    println!(
-        "\nLogical plan (verbose):\n{}",
-        plan.display_indent_schema()
-    );
-
-    let unparser = Unparser::default();
-    let sql = unparser.plan_to_sql(&plan)?.to_string();
-    println!("\nUnparsed SQL:\n{sql}");
-
+    let sql = Unparser::default().plan_to_sql(&plan)?.to_string();
+    insta::assert_snapshot!(sql, @r#"SELECT max(bla.j1_rename) AS "max1(j1_id)", max(bla.j1_rename) AS "max2(j1_id)" FROM (SELECT j1.j1_id AS j1_rename FROM j1) AS bla LIMIT 20"#);
     Ok(())
 }
 
-/// Same as test_unparse_aggregate_over_subquery_no_inner_proj but the outer
-/// Projection references the aggregate columns WITHOUT renaming them.
-/// The output column names should still match the Aggregate's aliases.
-///
-/// Plan shape:
-///   Projection: __agg_0, __agg_1
-///     Aggregate: aggr=[[max(bla.j1_rename) AS __agg_0, max(bla.j1_rename) AS __agg_1]]
-///       SubqueryAlias: bla
-///         Projection: j1.j1_id AS j1_rename
-///           TableScan: j1
+/// Projection → Aggregate (aliases inlined, no rename in outer Projection).
+/// Verifies the aggregate aliases are preserved as output column names.
 #[test]
 fn test_unparse_aggregate_no_outer_rename() -> Result<()> {
     let context = MockContextProvider {
@@ -3030,12 +2978,9 @@ fn test_unparse_aggregate_no_outer_rename() -> Result<()> {
         .schema();
 
     let scan = table_scan(Some("j1"), &j1_schema, None)?.build()?;
-    let inner_subquery = LogicalPlanBuilder::from(scan)
+    let plan = LogicalPlanBuilder::from(scan)
         .project(vec![col("j1.j1_id").alias("j1_rename")])?
         .alias("bla")?
-        .build()?;
-
-    let plan = LogicalPlanBuilder::from(inner_subquery)
         .aggregate(
             vec![] as Vec<Expr>,
             vec![
@@ -3046,16 +2991,37 @@ fn test_unparse_aggregate_no_outer_rename() -> Result<()> {
         .project(vec![col("__agg_0"), col("__agg_1")])?
         .build()?;
 
-    println!("Logical plan:\n{plan}");
-    println!(
-        "\nLogical plan (verbose):\n{}",
-        plan.display_indent_schema()
-    );
+    let sql = Unparser::default().plan_to_sql(&plan)?.to_string();
+    insta::assert_snapshot!(sql, @"SELECT max(bla.j1_rename) AS __agg_0, max(bla.j1_rename) AS __agg_1 FROM (SELECT j1.j1_id AS j1_rename FROM j1) AS bla");
+    Ok(())
+}
 
-    let unparser = Unparser::default();
-    let sql = unparser.plan_to_sql(&plan)?.to_string();
-    println!("\nUnparsed SQL:\n{sql}");
+/// Projection → Sort → Aggregate (aliases inlined into Aggregate).
+/// Verifies the Sort is folded into the outer SELECT rather than creating
+/// a spurious derived subquery.
+#[test]
+fn test_unparse_aggregate_with_sort_no_inner_proj() -> Result<()> {
+    let context = MockContextProvider {
+        state: MockSessionState::default(),
+    };
+    let j1_schema = context
+        .get_table_source(TableReference::bare("j1"))?
+        .schema();
 
+    let scan = table_scan(Some("j1"), &j1_schema, None)?.build()?;
+    let plan = LogicalPlanBuilder::from(scan)
+        .project(vec![col("j1.j1_id").alias("j1_rename")])?
+        .alias("bla")?
+        .aggregate(
+            vec![] as Vec<Expr>,
+            vec![max(col("bla.j1_rename")).alias("__agg_0")],
+        )?
+        .sort(vec![col("__agg_0").sort(true, true)])?
+        .project(vec![col("__agg_0").alias("max1(j1_id)")])?
+        .build()?;
+
+    let sql = Unparser::default().plan_to_sql(&plan)?.to_string();
+    insta::assert_snapshot!(sql, @r#"SELECT max(bla.j1_rename) AS "max1(j1_id)" FROM (SELECT j1.j1_id AS j1_rename FROM j1) AS bla ORDER BY max(bla.j1_rename) ASC NULLS FIRST"#);
     Ok(())
 }
 
