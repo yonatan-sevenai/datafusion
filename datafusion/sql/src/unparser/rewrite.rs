@@ -254,12 +254,13 @@ pub(super) fn rewrite_plan_for_sort_on_non_projected_fields(
             .map(|e| map.get(e).unwrap_or(e).clone())
             .collect::<Vec<_>>();
 
-        // Build a reverse map from alias name → underlying expression for
-        // sort columns that are dropped from the outer projection.  When
-        // the inner Projection is trimmed to `new_exprs` below, any alias
-        // that only existed in the inner Projection disappears, so ORDER BY
-        // references to it become dangling.  We inline the physical
-        // expression instead (e.g. ORDER BY "c" → ORDER BY "Z").
+        // The inner Projection may define aliases that the Sort references
+        // but the outer Projection does not include.  Since we are about to
+        // replace the inner Projection's expressions with `new_exprs` (which
+        // only contains the outer Projection's columns), those alias
+        // definitions will be lost.  To keep the Sort valid, rewrite any
+        // sort expression that references a dropped alias so that it uses
+        // the alias's underlying expression instead.
         let projected_aliases: HashSet<&str> = new_exprs
             .iter()
             .filter_map(|e| match e {
@@ -268,7 +269,7 @@ pub(super) fn rewrite_plan_for_sort_on_non_projected_fields(
             })
             .collect();
 
-        let alias_to_underlying: HashMap<String, Expr> = inner_p
+        let dropped_aliases: HashMap<String, Expr> = inner_p
             .expr
             .iter()
             .filter_map(|e| match e {
@@ -279,15 +280,14 @@ pub(super) fn rewrite_plan_for_sort_on_non_projected_fields(
             })
             .collect();
 
-        if !alias_to_underlying.is_empty() {
+        if !dropped_aliases.is_empty() {
             for sort_expr in &mut sort.expr {
                 let mut expr = sort_expr.expr.clone();
                 while let Expr::Alias(alias) = expr {
                     expr = *alias.expr;
                 }
                 if let Expr::Column(ref col) = expr {
-                    let name = col.name();
-                    if let Some(underlying) = alias_to_underlying.get(name) {
+                    if let Some(underlying) = dropped_aliases.get(col.name()) {
                         sort_expr.expr = underlying.clone();
                     }
                 }

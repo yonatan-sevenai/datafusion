@@ -2974,12 +2974,12 @@ fn test_unparse_manual_join_with_subquery_aggregate() -> Result<()> {
     Ok(())
 }
 
-/// Regression test: when the outer Projection excludes a Sort column that was
-/// defined as an alias in the inner Projection (through a SubqueryAlias), the
-/// Unparser must either preserve the subquery boundary or inline the physical
-/// column name into the ORDER BY clause.
+/// Regression test for https://github.com/apache/datafusion/issues/21490
 ///
-/// See: https://github.com/apache/datafusion/issues/XXXX
+/// When the outer Projection excludes a Sort column whose definition only
+/// exists as an alias in the inner Projection, the Unparser must inline the
+/// underlying expression into ORDER BY rather than emitting the now-missing
+/// alias name.
 #[test]
 fn test_sort_on_aliased_column_dropped_by_outer_projection() -> Result<()> {
     let schema = Schema::new(vec![
@@ -3017,9 +3017,7 @@ fn test_sort_on_aliased_column_dropped_by_outer_projection() -> Result<()> {
     let unparser = Unparser::default();
     let sql = unparser.plan_to_sql(&plan)?;
 
-    // The sort column "c" (aliased from "Z" in the inner Projection) must be
-    // inlined to the physical column in ORDER BY, since the outer Projection
-    // excludes it from the SELECT list.
+    // ORDER BY must reference the physical column, not the dropped alias.
     assert_snapshot!(
         sql,
         @r#"SELECT t."X" AS a, t."Y" AS b FROM phys_table AS t ORDER BY t."Z" DESC NULLS FIRST LIMIT 1"#
