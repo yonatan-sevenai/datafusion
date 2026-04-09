@@ -254,6 +254,46 @@ pub(super) fn rewrite_plan_for_sort_on_non_projected_fields(
             .map(|e| map.get(e).unwrap_or(e).clone())
             .collect::<Vec<_>>();
 
+        // Build a reverse map from alias name → underlying expression for
+        // sort columns that are dropped from the outer projection.  When
+        // the inner Projection is trimmed to `new_exprs` below, any alias
+        // that only existed in the inner Projection disappears, so ORDER BY
+        // references to it become dangling.  We inline the physical
+        // expression instead (e.g. ORDER BY "c" → ORDER BY "Z").
+        let projected_aliases: HashSet<&str> = new_exprs
+            .iter()
+            .filter_map(|e| match e {
+                Expr::Alias(alias) => Some(alias.name.as_str()),
+                _ => None,
+            })
+            .collect();
+
+        let alias_to_underlying: HashMap<String, Expr> = inner_p
+            .expr
+            .iter()
+            .filter_map(|e| match e {
+                Expr::Alias(alias) if !projected_aliases.contains(alias.name.as_str()) => {
+                    Some((alias.name.clone(), (*alias.expr).clone()))
+                }
+                _ => None,
+            })
+            .collect();
+
+        if !alias_to_underlying.is_empty() {
+            for sort_expr in &mut sort.expr {
+                let mut expr = sort_expr.expr.clone();
+                while let Expr::Alias(alias) = expr {
+                    expr = *alias.expr;
+                }
+                if let Expr::Column(ref col) = expr {
+                    let name = col.name();
+                    if let Some(underlying) = alias_to_underlying.get(name) {
+                        sort_expr.expr = underlying.clone();
+                    }
+                }
+            }
+        }
+
         inner_p.expr.clone_from(&new_exprs);
         sort.input = Arc::new(LogicalPlan::Projection(inner_p));
 

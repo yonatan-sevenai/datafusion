@@ -2973,3 +2973,57 @@ fn test_unparse_manual_join_with_subquery_aggregate() -> Result<()> {
 
     Ok(())
 }
+
+/// Regression test: when the outer Projection excludes a Sort column that was
+/// defined as an alias in the inner Projection (through a SubqueryAlias), the
+/// Unparser must either preserve the subquery boundary or inline the physical
+/// column name into the ORDER BY clause.
+///
+/// See: https://github.com/apache/datafusion/issues/XXXX
+#[test]
+fn test_sort_on_aliased_column_dropped_by_outer_projection() -> Result<()> {
+    let schema = Schema::new(vec![
+        Field::new("X", DataType::Utf8, true),
+        Field::new("Y", DataType::Utf8, true),
+        Field::new("Z", DataType::Utf8, true),
+    ]);
+
+    // Build:
+    //   Projection: [a, b]                         -- outer: excludes sort column "c"
+    //     Sort: [c DESC, fetch=1]                   -- references alias "c"
+    //       Projection: [X AS a, Y AS b, Z AS c]    -- defines alias "c"
+    //         SubqueryAlias: t
+    //           TableScan: phys_table [X, Y, Z]
+    let plan = table_scan(Some("phys_table"), &schema, None)?
+        .alias("t")?
+        .project(vec![
+            Expr::Column(Column::new(Some(TableReference::bare("t")), "X"))
+                .alias("a"),
+            Expr::Column(Column::new(Some(TableReference::bare("t")), "Y"))
+                .alias("b"),
+            Expr::Column(Column::new(Some(TableReference::bare("t")), "Z"))
+                .alias("c"),
+        ])?
+        .sort_with_limit(
+            vec![Expr::Column(Column::new_unqualified("c")).sort(false, true)],
+            Some(1),
+        )?
+        .project(vec![
+            Expr::Column(Column::new_unqualified("a")),
+            Expr::Column(Column::new_unqualified("b")),
+        ])?
+        .build()?;
+
+    let unparser = Unparser::default();
+    let sql = unparser.plan_to_sql(&plan)?;
+
+    // The sort column "c" (aliased from "Z" in the inner Projection) must be
+    // inlined to the physical column in ORDER BY, since the outer Projection
+    // excludes it from the SELECT list.
+    assert_snapshot!(
+        sql,
+        @r#"SELECT t."X" AS a, t."Y" AS b FROM phys_table AS t ORDER BY t."Z" DESC NULLS FIRST LIMIT 1"#
+    );
+
+    Ok(())
+}
