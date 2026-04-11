@@ -3009,8 +3009,7 @@ fn snowflake_unnest_to_lateral_flatten_simple() -> Result<(), DataFusionError> {
 }
 
 #[test]
-fn snowflake_unnest_to_lateral_flatten_with_cross_join() -> Result<(), DataFusionError>
-{
+fn snowflake_unnest_to_lateral_flatten_with_cross_join() -> Result<(), DataFusionError> {
     let snowflake = SnowflakeDialect::new();
     roundtrip_statement_with_dialect_helper!(
         sql: "SELECT * FROM UNNEST([1,2,3]), j1",
@@ -3022,13 +3021,82 @@ fn snowflake_unnest_to_lateral_flatten_with_cross_join() -> Result<(), DataFusio
 }
 
 #[test]
-fn snowflake_unnest_to_lateral_flatten_outer_ref() -> Result<(), DataFusionError> {
+fn snowflake_unnest_to_lateral_flatten_cross_join_inline() -> Result<(), DataFusionError>
+{
+    // Cross join with two inline UNNEST sources — both produce valid FLATTEN.
+    // NOTE: UNNEST(table.column) is NOT tested with Snowflake because
+    // LATERAL FLATTEN(INPUT => col) requires the column to be a Snowflake
+    // VARIANT/ARRAY type, which cannot be validated at unparse time.
     let snowflake = SnowflakeDialect::new();
     roundtrip_statement_with_dialect_helper!(
-        sql: "SELECT * FROM unnest_table u, UNNEST(u.array_col)",
+        sql: "SELECT * FROM UNNEST([1,2,3]) u(c1) JOIN j1 ON u.c1 = j1.j1_id",
         parser_dialect: GenericDialect {},
         unparser_dialect: snowflake,
-        expected: @r#"SELECT "u"."array_col", "u"."struct_col", _unnest."VALUE" FROM "unnest_table" AS "u" CROSS JOIN LATERAL FLATTEN(INPUT => "u"."array_col") AS _unnest"#,
+        expected: @r#"SELECT "u"."c1", "j1"."j1_id", "j1"."j1_string" FROM (SELECT "_unnest"."VALUE" AS "c1" FROM LATERAL FLATTEN(INPUT => [1, 2, 3]) AS _unnest) AS "u" INNER JOIN "j1" ON ("u"."c1" = "j1"."j1_id")"#,
+    );
+    Ok(())
+}
+
+// --- Edge case tests for Snowflake FLATTEN ---
+
+#[test]
+fn snowflake_flatten_implicit_from() -> Result<(), DataFusionError> {
+    // UNNEST in SELECT clause (no explicit FROM UNNEST) — implicit table factor
+    let snowflake = SnowflakeDialect::new();
+    roundtrip_statement_with_dialect_helper!(
+        sql: "SELECT UNNEST([1,2,3])",
+        parser_dialect: GenericDialect {},
+        unparser_dialect: snowflake,
+        expected: @"SELECT _unnest.\"VALUE\" FROM LATERAL FLATTEN(INPUT => [1, 2, 3]) AS _unnest",
+    );
+    Ok(())
+}
+
+#[test]
+fn snowflake_flatten_string_array() -> Result<(), DataFusionError> {
+    // String array unnest
+    let snowflake = SnowflakeDialect::new();
+    roundtrip_statement_with_dialect_helper!(
+        sql: "SELECT * FROM UNNEST(['a','b','c'])",
+        parser_dialect: GenericDialect {},
+        unparser_dialect: snowflake,
+        expected: @"SELECT _unnest.\"VALUE\" FROM LATERAL FLATTEN(INPUT => ['a', 'b', 'c']) AS _unnest",
+    );
+    Ok(())
+}
+
+#[test]
+fn snowflake_flatten_select_unnest_with_alias() -> Result<(), DataFusionError> {
+    let snowflake = SnowflakeDialect::new();
+    roundtrip_statement_with_dialect_helper!(
+        sql: "SELECT UNNEST([1,2,3]) as c1",
+        parser_dialect: GenericDialect {},
+        unparser_dialect: snowflake,
+        expected: @r#"SELECT "_unnest"."VALUE" AS "c1" FROM LATERAL FLATTEN(INPUT => [1, 2, 3]) AS _unnest"#,
+    );
+    Ok(())
+}
+
+#[test]
+fn snowflake_flatten_select_unnest_plus_literal() -> Result<(), DataFusionError> {
+    let snowflake = SnowflakeDialect::new();
+    roundtrip_statement_with_dialect_helper!(
+        sql: "SELECT UNNEST([1,2,3]), 1",
+        parser_dialect: GenericDialect {},
+        unparser_dialect: snowflake,
+        expected: @r#"SELECT _unnest."VALUE", "Int64(1)" FROM LATERAL FLATTEN(INPUT => [1, 2, 3]) AS _unnest"#,
+    );
+    Ok(())
+}
+
+#[test]
+fn snowflake_flatten_from_unnest_with_table_alias() -> Result<(), DataFusionError> {
+    let snowflake = SnowflakeDialect::new();
+    roundtrip_statement_with_dialect_helper!(
+        sql: "SELECT * FROM UNNEST([1,2,3]) AS t1 (c1)",
+        parser_dialect: GenericDialect {},
+        unparser_dialect: snowflake,
+        expected: @r#"SELECT "t1"."c1" FROM (SELECT "_unnest"."VALUE" AS "c1" FROM LATERAL FLATTEN(INPUT => [1, 2, 3]) AS _unnest) AS "t1""#,
     );
     Ok(())
 }

@@ -29,21 +29,25 @@ use super::{
     utils::{
         find_agg_node_within_select, find_unnest_node_within_select,
         find_window_nodes_within_select, try_transform_to_simple_table_scan_with_filters,
-        unproject_sort_expr, unproject_unnest_expr, unproject_window_exprs,
+        unproject_sort_expr, unproject_unnest_expr,
+        unproject_unnest_expr_as_flatten_value, unproject_window_exprs,
     },
 };
 use crate::unparser::extension_unparser::{
     UnparseToStatementResult, UnparseWithinStatementResult,
 };
 use crate::unparser::utils::{find_unnest_node_until_relation, unproject_agg_exprs};
-use crate::unparser::{ast::UnnestRelationBuilder, rewrite::rewrite_qualify};
+use crate::unparser::{
+    ast::FLATTEN_DEFAULT_ALIAS, ast::FlattenRelationBuilder, ast::UnnestRelationBuilder,
+    rewrite::rewrite_qualify,
+};
 use crate::utils::UNNEST_PLACEHOLDER;
 use datafusion_common::{
     Column, DataFusionError, Result, ScalarValue, TableReference, assert_or_internal_err,
     internal_err, not_impl_err,
     tree_node::{TransformedResult, TreeNode},
 };
-use datafusion_expr::expr::OUTER_REFERENCE_COLUMN_PREFIX;
+use datafusion_expr::expr::{OUTER_REFERENCE_COLUMN_PREFIX, UNNEST_COLUMN_PREFIX};
 use datafusion_expr::{
     BinaryExpr, Distinct, Expr, JoinConstraint, JoinType, LogicalPlan,
     LogicalPlanBuilder, Operator, Projection, SortExpr, TableScan, Unnest,
@@ -236,10 +240,23 @@ impl Unparser<'_> {
 
         // If an Unnest node is found within the select, find and unproject the unnest column
         if let Some(unnest) = find_unnest_node_within_select(plan) {
-            exprs = exprs
-                .into_iter()
-                .map(|e| unproject_unnest_expr(e, unnest))
-                .collect::<Result<Vec<_>>>()?;
+            if self.dialect.unnest_as_lateral_flatten() {
+                exprs = exprs
+                    .into_iter()
+                    .map(|e| {
+                        unproject_unnest_expr_as_flatten_value(
+                            e,
+                            unnest,
+                            FLATTEN_DEFAULT_ALIAS,
+                        )
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+            } else {
+                exprs = exprs
+                    .into_iter()
+                    .map(|e| unproject_unnest_expr(e, unnest))
+                    .collect::<Result<Vec<_>>>()?;
+            }
         };
 
         match (
@@ -277,9 +294,35 @@ impl Unparser<'_> {
                 select.projection(items);
             }
             _ => {
+                let use_flatten = self.dialect.unnest_as_lateral_flatten();
                 let items = exprs
                     .iter()
-                    .map(|e| self.select_item_to_sql(e))
+                    .map(|e| {
+                        if use_flatten {
+                            // For Snowflake FLATTEN: rewrite UNNEST output columns
+                            // to `_unnest."VALUE"`. After unproject_unnest_expr_as_flatten_value
+                            // runs, the expression is either:
+                            // - bare Column with UNNEST prefix (outer ref case)
+                            // - Alias { name: "UNNEST(...)", expr: Column(_unnest.VALUE) }
+                            //   (the inner column is already rewritten but the alias preserves
+                            //    the internal UNNEST display name)
+                            let is_unnest_col = match e {
+                                Expr::Column(col) => col
+                                    .name
+                                    .starts_with(&format!("{UNNEST_COLUMN_PREFIX}(")),
+                                Expr::Alias(Alias { name, .. }) => {
+                                    name.starts_with(&format!("{UNNEST_COLUMN_PREFIX}("))
+                                }
+                                _ => false,
+                            };
+                            if is_unnest_col {
+                                return Ok(self.build_flatten_value_select_item(
+                                    FLATTEN_DEFAULT_ALIAS,
+                                ));
+                            }
+                        }
+                        self.select_item_to_sql(e)
+                    })
                     .collect::<Result<Vec<_>>>()?;
                 select.projection(items);
             }
@@ -384,6 +427,34 @@ impl Unparser<'_> {
                 } else {
                     None
                 };
+                if self.dialect.unnest_as_lateral_flatten()
+                    && unnest_input_type.is_some()
+                    && let LogicalPlan::Unnest(unnest) = p.input.as_ref()
+                    && let Some(flatten_relation) =
+                        self.try_unnest_to_lateral_flatten_sql(unnest)?
+                {
+                    let alias_name = flatten_relation.alias_name().to_string();
+                    relation.flatten(flatten_relation);
+
+                    // Only set the projection if it hasn't already been set by
+                    // an outer Projection (e.g. SELECT * FROM t, UNNEST(...)).
+                    // When the outer Projection already called
+                    // reconstruct_select_statement, the SELECT list is correct
+                    // and we must not replace it with just `_unnest."VALUE"`.
+                    if !select.already_projected() {
+                        let value_expr =
+                            self.build_flatten_value_select_item(&alias_name);
+                        select.projection(vec![value_expr]);
+                        select.already_projected();
+                    }
+
+                    return self.select_to_sql_recursively(
+                        p.input.as_ref(),
+                        query,
+                        select,
+                        relation,
+                    );
+                }
                 if self.dialect.unnest_as_table_factor()
                     && unnest_input_type.is_some()
                     && let LogicalPlan::Unnest(unnest) = &p.input.as_ref()
@@ -1001,11 +1072,34 @@ impl Unparser<'_> {
                 }
             }
             LogicalPlan::Unnest(unnest) => {
+                if self.dialect.unnest_as_lateral_flatten()
+                    && !unnest.struct_type_columns.is_empty()
+                {
+                    return not_impl_err!(
+                        "Snowflake FLATTEN cannot unparse struct unnest: \
+                         DataFusion expands struct fields into columns (horizontal), \
+                         but Snowflake FLATTEN expands them into rows (vertical). \
+                         Columns: {:?}",
+                        unnest.struct_type_columns
+                    );
+                }
+
                 assert_or_internal_err!(
                     unnest.struct_type_columns.is_empty(),
                     "Struct type columns are not currently supported in UNNEST: {:?}",
                     unnest.struct_type_columns
                 );
+
+                // For Snowflake FLATTEN: if the relation hasn't been set yet
+                // (UNNEST was in SELECT clause, not FROM clause), set the FLATTEN
+                // relation here so the FROM clause is emitted.
+                if self.dialect.unnest_as_lateral_flatten()
+                    && !relation.has_relation()
+                    && let Some(flatten_relation) =
+                        self.try_unnest_to_lateral_flatten_sql(unnest)?
+                {
+                    relation.flatten(flatten_relation);
+                }
 
                 // In the case of UNNEST, the Unnest node is followed by a duplicate Projection node that we should skip.
                 // Otherwise, there will be a duplicate SELECT clause.
@@ -1025,7 +1119,9 @@ impl Unparser<'_> {
                 if find_unnest_node_until_relation(subquery.subquery.as_ref())
                     .is_some() =>
             {
-                if self.dialect.unnest_as_table_factor() {
+                if self.dialect.unnest_as_table_factor()
+                    || self.dialect.unnest_as_lateral_flatten()
+                {
                     self.select_to_sql_recursively(
                         subquery.subquery.as_ref(),
                         query,
@@ -1098,6 +1194,40 @@ impl Unparser<'_> {
         unnest_relation.array_exprs(exprs);
 
         Ok(Some(unnest_relation))
+    }
+
+    /// Build a `SELECT alias."VALUE"` item for Snowflake FLATTEN output.
+    fn build_flatten_value_select_item(&self, alias_name: &str) -> ast::SelectItem {
+        let compound = ast::Expr::CompoundIdentifier(vec![
+            self.new_ident_without_quote_style(alias_name.to_string()),
+            Ident::with_quote('"', "VALUE"),
+        ]);
+        ast::SelectItem::UnnamedExpr(compound)
+    }
+
+    /// Convert an `Unnest` logical plan node to a `LATERAL FLATTEN(INPUT => expr, ...)`
+    /// table factor for Snowflake-style SQL output.
+    fn try_unnest_to_lateral_flatten_sql(
+        &self,
+        unnest: &Unnest,
+    ) -> Result<Option<FlattenRelationBuilder>> {
+        let LogicalPlan::Projection(projection) = unnest.input.as_ref() else {
+            return Ok(None);
+        };
+
+        // For now, handle the simple case of a single expression to flatten.
+        // Multi-expression would require multiple LATERAL FLATTEN calls chained together.
+        let Some(first_expr) = projection.expr.first() else {
+            return Ok(None);
+        };
+
+        let input_expr = self.expr_to_sql(first_expr)?;
+
+        let mut flatten = FlattenRelationBuilder::default();
+        flatten.input_expr(input_expr);
+        flatten.outer(unnest.options.preserve_nulls);
+
+        Ok(Some(flatten))
     }
 
     fn is_scan_with_pushdown(scan: &TableScan) -> bool {

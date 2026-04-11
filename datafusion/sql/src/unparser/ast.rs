@@ -432,11 +432,11 @@ pub struct RelationBuilder {
 }
 
 #[derive(Clone)]
-#[expect(clippy::large_enum_variant)]
 enum TableFactorBuilder {
     Table(TableRelationBuilder),
     Derived(DerivedRelationBuilder),
     Unnest(UnnestRelationBuilder),
+    Flatten(FlattenRelationBuilder),
     Empty,
 }
 
@@ -458,6 +458,11 @@ impl RelationBuilder {
         self
     }
 
+    pub fn flatten(&mut self, value: FlattenRelationBuilder) -> &mut Self {
+        self.relation = Some(TableFactorBuilder::Flatten(value));
+        self
+    }
+
     pub fn empty(&mut self) -> &mut Self {
         self.relation = Some(TableFactorBuilder::Empty);
         self
@@ -474,6 +479,9 @@ impl RelationBuilder {
             Some(TableFactorBuilder::Unnest(ref mut rel_builder)) => {
                 rel_builder.alias = value;
             }
+            Some(TableFactorBuilder::Flatten(ref mut rel_builder)) => {
+                rel_builder.alias = value;
+            }
             Some(TableFactorBuilder::Empty) => (),
             None => (),
         }
@@ -484,6 +492,7 @@ impl RelationBuilder {
             Some(TableFactorBuilder::Table(ref value)) => Some(value.build()?),
             Some(TableFactorBuilder::Derived(ref value)) => Some(value.build()?),
             Some(TableFactorBuilder::Unnest(ref value)) => Some(value.build()?),
+            Some(TableFactorBuilder::Flatten(ref value)) => Some(value.build()?),
             Some(TableFactorBuilder::Empty) => None,
             None => return Err(Into::into(UninitializedFieldError::from("relation"))),
         })
@@ -683,6 +692,94 @@ impl UnnestRelationBuilder {
 }
 
 impl Default for UnnestRelationBuilder {
+    fn default() -> Self {
+        Self::create_empty()
+    }
+}
+
+/// Default table alias for FLATTEN table factors.
+/// Snowflake requires an alias to reference output columns (e.g. `_unnest.VALUE`).
+pub const FLATTEN_DEFAULT_ALIAS: &str = "_unnest";
+
+/// Builds a `LATERAL FLATTEN(INPUT => expr, OUTER => bool)` table factor
+/// for Snowflake-style unnesting.
+#[derive(Clone)]
+pub struct FlattenRelationBuilder {
+    pub alias: Option<ast::TableAlias>,
+    /// The input expression to flatten (e.g. a column reference).
+    pub input_expr: Option<ast::Expr>,
+    /// Whether to preserve rows for NULL/empty inputs (Snowflake `OUTER` param).
+    pub outer: bool,
+}
+
+impl FlattenRelationBuilder {
+    pub fn alias(&mut self, value: Option<ast::TableAlias>) -> &mut Self {
+        self.alias = value;
+        self
+    }
+
+    pub fn input_expr(&mut self, value: ast::Expr) -> &mut Self {
+        self.input_expr = Some(value);
+        self
+    }
+
+    pub fn outer(&mut self, value: bool) -> &mut Self {
+        self.outer = value;
+        self
+    }
+
+    pub fn build(&self) -> Result<ast::TableFactor, BuilderError> {
+        let input = self.input_expr.clone().ok_or_else(|| {
+            BuilderError::from(UninitializedFieldError::from("input_expr"))
+        })?;
+
+        let mut args = vec![ast::FunctionArg::Named {
+            name: ast::Ident::new("INPUT"),
+            arg: ast::FunctionArgExpr::Expr(input),
+            operator: ast::FunctionArgOperator::RightArrow,
+        }];
+
+        if self.outer {
+            args.push(ast::FunctionArg::Named {
+                name: ast::Ident::new("OUTER"),
+                arg: ast::FunctionArgExpr::Expr(ast::Expr::Value(
+                    ast::Value::Boolean(true).into(),
+                )),
+                operator: ast::FunctionArgOperator::RightArrow,
+            });
+        }
+
+        Ok(ast::TableFactor::Function {
+            lateral: true,
+            name: ast::ObjectName::from(vec![ast::Ident::new("FLATTEN")]),
+            args,
+            alias: self.alias.clone(),
+        })
+    }
+
+    /// Returns the alias name for this FLATTEN relation.
+    /// Used to build qualified column references like `alias.VALUE`.
+    pub fn alias_name(&self) -> &str {
+        self.alias
+            .as_ref()
+            .map(|a| a.name.value.as_str())
+            .unwrap_or(FLATTEN_DEFAULT_ALIAS)
+    }
+
+    fn create_empty() -> Self {
+        Self {
+            alias: Some(ast::TableAlias {
+                name: ast::Ident::new(FLATTEN_DEFAULT_ALIAS),
+                columns: vec![],
+                explicit: true,
+            }),
+            input_expr: None,
+            outer: false,
+        }
+    }
+}
+
+impl Default for FlattenRelationBuilder {
     fn default() -> Self {
         Self::create_empty()
     }
