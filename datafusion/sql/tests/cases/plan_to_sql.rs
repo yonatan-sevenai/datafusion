@@ -3183,3 +3183,36 @@ fn snowflake_flatten_unnest_udf_result() -> Result<(), DataFusionError> {
     insta::assert_snapshot!(actual, @r#"SELECT _unnest."VALUE" FROM "j1" CROSS JOIN LATERAL FLATTEN(INPUT => json_get_array("j1"."j1_string")) AS _unnest LIMIT 5"#);
     Ok(())
 }
+
+#[test]
+fn snowflake_unnest_through_subquery_alias() -> Result<(), DataFusionError> {
+    // Build: Projection → Unnest → SubqueryAlias → Projection → TableScan
+    // This simulates the plan produced when a virtual/passthrough table
+    // wraps the source in a SubqueryAlias, which sits between the Unnest
+    // and its inner Projection.
+
+    let schema = Schema::new(vec![Field::new(
+        "items",
+        DataType::List(Arc::new(Field::new_list_field(DataType::Utf8, true))),
+        true,
+    )]);
+
+    let plan = table_scan(Some("source"), &schema, None)?
+        .project(vec![col("items").alias("__unnest_placeholder(items)")])?
+        .alias("t")? // SubqueryAlias — this is what breaks
+        .unnest_column("__unnest_placeholder(items)")?
+        .project(vec![col("__unnest_placeholder(items)").alias("item")])?
+        .build()?;
+
+    let snowflake = SnowflakeDialect::new();
+    let unparser = Unparser::new(&snowflake);
+    let result = unparser.plan_to_sql(&plan)?;
+    let sql_str = result.to_string();
+
+    // Should contain LATERAL FLATTEN, not error
+    assert!(
+        sql_str.contains("LATERAL FLATTEN"),
+        "Expected LATERAL FLATTEN in SQL, got: {sql_str}"
+    );
+    Ok(())
+}

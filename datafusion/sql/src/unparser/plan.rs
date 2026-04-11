@@ -442,6 +442,14 @@ impl Unparser<'_> {
                     // vs an inline array (EmptyRelation).
                     let inner_projection = match unnest.input.as_ref() {
                         LogicalPlan::Projection(proj) => proj,
+                        LogicalPlan::SubqueryAlias(alias) => match alias.input.as_ref() {
+                            LogicalPlan::Projection(proj) => proj,
+                            other => {
+                                return internal_err!(
+                                    "Unnest input (through SubqueryAlias) is not a Projection: {other:?}"
+                                );
+                            }
+                        },
                         other => {
                             return internal_err!(
                                 "Unnest input is not a Projection: {other:?}"
@@ -1186,6 +1194,11 @@ impl Unparser<'_> {
                 if let LogicalPlan::Projection(p) = unnest.input.as_ref() {
                     // continue with projection input
                     self.select_to_sql_recursively(&p.input, query, select, relation)
+                } else if let LogicalPlan::SubqueryAlias(alias) = unnest.input.as_ref()
+                    && let LogicalPlan::Projection(p) = alias.input.as_ref()
+                {
+                    // SubqueryAlias wraps the Projection (e.g. passthrough tables)
+                    self.select_to_sql_recursively(&p.input, query, select, relation)
                 } else {
                     internal_err!("Unnest input is not a Projection: {unnest:?}")
                 }
@@ -1250,13 +1263,13 @@ impl Unparser<'_> {
             }
             _ => return None,
         };
-        if let Expr::Column(Column { name, .. }) = inner {
-            if let Some(prefix) = name.strip_prefix(UNNEST_PLACEHOLDER) {
-                if prefix.starts_with(&format!("({OUTER_REFERENCE_COLUMN_PREFIX}(")) {
-                    return Some(UnnestInputType::OuterReference);
-                }
-                return Some(UnnestInputType::Scalar);
+        if let Expr::Column(Column { name, .. }) = inner
+            && let Some(prefix) = name.strip_prefix(UNNEST_PLACEHOLDER)
+        {
+            if prefix.starts_with(&format!("({OUTER_REFERENCE_COLUMN_PREFIX}(")) {
+                return Some(UnnestInputType::OuterReference);
             }
+            return Some(UnnestInputType::Scalar);
         }
         None
     }
@@ -1306,8 +1319,16 @@ impl Unparser<'_> {
         &self,
         unnest: &Unnest,
     ) -> Result<Option<FlattenRelationBuilder>> {
-        let LogicalPlan::Projection(projection) = unnest.input.as_ref() else {
-            return Ok(None);
+        let projection = match unnest.input.as_ref() {
+            LogicalPlan::Projection(p) => p,
+            LogicalPlan::SubqueryAlias(alias) => {
+                if let LogicalPlan::Projection(p) = alias.input.as_ref() {
+                    p
+                } else {
+                    return Ok(None);
+                }
+            }
+            _ => return Ok(None),
         };
 
         // For now, handle the simple case of a single expression to flatten.
