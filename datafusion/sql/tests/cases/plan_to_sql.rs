@@ -2942,6 +2942,268 @@ fn roundtrip_subquery_aggregate_with_column_alias() -> Result<(), DataFusionErro
     Ok(())
 }
 
+/// Roundtrip: aggregate over a subquery projection with limit.
+#[test]
+fn roundtrip_aggregate_over_subquery() -> Result<(), DataFusionError> {
+    roundtrip_statement_with_dialect_helper!(
+        sql: r#"SELECT __agg_0 AS "min(j1_id)", __agg_1 AS "max(j1_id)" FROM (SELECT min(j1_rename) AS __agg_0, max(j1_rename) AS __agg_1 FROM (SELECT j1_id AS j1_rename FROM j1) AS bla LIMIT 20)"#,
+        parser_dialect: GenericDialect {},
+        unparser_dialect: UnparserDefaultDialect {},
+        expected: @r#"SELECT __agg_0 AS "min(j1_id)", __agg_1 AS "max(j1_id)" FROM (SELECT min(bla.j1_rename) AS __agg_0, max(bla.j1_rename) AS __agg_1 FROM (SELECT j1.j1_id AS j1_rename FROM j1) AS bla LIMIT 20)"#,
+    );
+    Ok(())
+}
+
+/// Projection → Limit → Aggregate (aliases inlined into Aggregate, no
+/// intermediate Projection). Verifies the Limit is folded into the outer
+/// SELECT rather than creating a spurious derived subquery.
+#[test]
+fn test_unparse_aggregate_over_subquery_no_inner_proj() -> Result<()> {
+    let context = MockContextProvider {
+        state: MockSessionState::default(),
+    };
+    let j1_schema = context
+        .get_table_source(TableReference::bare("j1"))?
+        .schema();
+
+    let scan = table_scan(Some("j1"), &j1_schema, None)?.build()?;
+    let plan = LogicalPlanBuilder::from(scan)
+        .project(vec![col("j1.j1_id").alias("j1_rename")])?
+        .alias("bla")?
+        .aggregate(
+            vec![] as Vec<Expr>,
+            vec![
+                max(col("bla.j1_rename")).alias("__agg_0"),
+                max(col("bla.j1_rename")).alias("__agg_1"),
+            ],
+        )?
+        .limit(0, Some(20))?
+        .project(vec![
+            col("__agg_0").alias("max1(j1_id)"),
+            col("__agg_1").alias("max2(j1_id)"),
+        ])?
+        .build()?;
+
+    let sql = Unparser::default().plan_to_sql(&plan)?.to_string();
+    insta::assert_snapshot!(sql, @r#"SELECT max(bla.j1_rename) AS "max1(j1_id)", max(bla.j1_rename) AS "max2(j1_id)" FROM (SELECT j1.j1_id AS j1_rename FROM j1) AS bla LIMIT 20"#);
+    Ok(())
+}
+
+/// Projection → Aggregate (aliases inlined, no rename in outer Projection).
+/// Verifies the aggregate aliases are preserved as output column names.
+#[test]
+fn test_unparse_aggregate_no_outer_rename() -> Result<()> {
+    let context = MockContextProvider {
+        state: MockSessionState::default(),
+    };
+    let j1_schema = context
+        .get_table_source(TableReference::bare("j1"))?
+        .schema();
+
+    let scan = table_scan(Some("j1"), &j1_schema, None)?.build()?;
+    let plan = LogicalPlanBuilder::from(scan)
+        .project(vec![col("j1.j1_id").alias("j1_rename")])?
+        .alias("bla")?
+        .aggregate(
+            vec![] as Vec<Expr>,
+            vec![
+                max(col("bla.j1_rename")).alias("__agg_0"),
+                max(col("bla.j1_rename")).alias("__agg_1"),
+            ],
+        )?
+        .project(vec![col("__agg_0"), col("__agg_1")])?
+        .build()?;
+
+    let sql = Unparser::default().plan_to_sql(&plan)?.to_string();
+    insta::assert_snapshot!(sql, @"SELECT max(bla.j1_rename) AS __agg_0, max(bla.j1_rename) AS __agg_1 FROM (SELECT j1.j1_id AS j1_rename FROM j1) AS bla");
+    Ok(())
+}
+
+/// Projection → Sort → Aggregate (aliases inlined into Aggregate).
+/// Verifies the Sort is folded into the outer SELECT rather than creating
+/// a spurious derived subquery.
+#[test]
+fn test_unparse_aggregate_with_sort_no_inner_proj() -> Result<()> {
+    let context = MockContextProvider {
+        state: MockSessionState::default(),
+    };
+    let j1_schema = context
+        .get_table_source(TableReference::bare("j1"))?
+        .schema();
+
+    let scan = table_scan(Some("j1"), &j1_schema, None)?.build()?;
+    let plan = LogicalPlanBuilder::from(scan)
+        .project(vec![col("j1.j1_id").alias("j1_rename")])?
+        .alias("bla")?
+        .aggregate(
+            vec![] as Vec<Expr>,
+            vec![max(col("bla.j1_rename")).alias("__agg_0")],
+        )?
+        .sort(vec![col("__agg_0").sort(true, true)])?
+        .project(vec![col("__agg_0").alias("max1(j1_id)")])?
+        .build()?;
+
+    let sql = Unparser::default().plan_to_sql(&plan)?.to_string();
+    insta::assert_snapshot!(sql, @r#"SELECT max(bla.j1_rename) AS "max1(j1_id)" FROM (SELECT j1.j1_id AS j1_rename FROM j1) AS bla ORDER BY max(bla.j1_rename) ASC NULLS FIRST"#);
+    Ok(())
+}
+
+/// Test unparsing Projection → SubqueryAlias → Projection → TableScan(filters).
+///
+/// Plan: Projection → SubqueryAlias("sub") → Projection → TableScan(person, filter)
+/// Uses the `person` table (8 columns) so partial projections naturally
+/// exercise the `unparse_table_scan_pushdown` derived-subquery path.
+#[test]
+fn test_unparse_projection_over_subquery_with_filtered_scan() -> Result<()> {
+    let context = MockContextProvider {
+        state: MockSessionState::default(),
+    };
+    let person_schema = context
+        .get_table_source(TableReference::bare("person"))?
+        .schema();
+
+    // Scan projects only id and first_name (2 of 8 columns), with a filter
+    let scan = table_scan_with_filters(
+        Some("person"),
+        &person_schema,
+        Some(vec![0, 1]),
+        vec![col("person.id").gt(lit(5u32))],
+    )?
+    .build()?;
+
+    let plan = LogicalPlanBuilder::from(scan)
+        .project(vec![col("person.id"), col("person.first_name")])?
+        .alias("sub")?
+        .project(vec![col("sub.id"), col("sub.first_name")])?
+        .build()?;
+
+    let sql = Unparser::default().plan_to_sql(&plan)?.to_string();
+    insta::assert_snapshot!(sql, @"SELECT sub.id, sub.first_name FROM (SELECT sub.id, sub.first_name FROM person AS sub WHERE (sub.id > 5)) AS sub");
+
+    Ok(())
+}
+
+/// SubqueryAlias wraps a Projection over a filtered TableScan.
+///
+/// Plan: SubqueryAlias("bla") → Projection → TableScan(person, filter)
+#[test]
+fn test_unparse_subquery_alias_over_projection_with_filtered_scan() -> Result<()> {
+    let context = MockContextProvider {
+        state: MockSessionState::default(),
+    };
+    let person_schema = context
+        .get_table_source(TableReference::bare("person"))?
+        .schema();
+
+    let scan = table_scan_with_filters(
+        Some("person"),
+        &person_schema,
+        Some(vec![0, 1, 3]),
+        vec![col("person.id").gt(lit(5u32))],
+    )?
+    .build()?;
+
+    let plan = LogicalPlanBuilder::from(scan)
+        .project(vec![
+            col("person.id").alias("id_renamed"),
+            col("person.first_name"),
+        ])?
+        .alias("bla")?
+        .build()?;
+
+    let sql = Unparser::default().plan_to_sql(&plan)?.to_string();
+    // BUG: currently the WHERE clause is hoisted outside the derived subquery:
+    //   ... FROM (SELECT ... FROM person AS bla) AS bla WHERE (bla.id > 5)
+    // The snapshot below is the CORRECT expected output (filter inside the subquery).
+    // This test will fail until the bug is fixed.
+    insta::assert_snapshot!(sql, @"SELECT bla.id AS id_renamed, bla.first_name FROM (SELECT bla.id, bla.first_name, bla.age FROM person AS bla WHERE (bla.id > 5)) AS bla");
+
+    Ok(())
+}
+
+/// Projection outside, SubqueryAlias inside, no inner projection.
+///
+/// Plan: Projection → SubqueryAlias("bla") → TableScan(person, filter)
+#[test]
+fn test_unparse_projection_over_subquery_alias_no_inner_proj() -> Result<()> {
+    let context = MockContextProvider {
+        state: MockSessionState::default(),
+    };
+    let person_schema = context
+        .get_table_source(TableReference::bare("person"))?
+        .schema();
+
+    let scan = table_scan_with_filters(
+        Some("person"),
+        &person_schema,
+        Some(vec![0, 1, 3]),
+        vec![col("person.id").gt(lit(5u32))],
+    )?
+    .build()?;
+
+    let plan = LogicalPlanBuilder::from(scan)
+        .alias("bla")?
+        .project(vec![
+            col("bla.id").alias("id_renamed"),
+            col("bla.first_name"),
+        ])?
+        .build()?;
+
+    let sql = Unparser::default().plan_to_sql(&plan)?.to_string();
+    insta::assert_snapshot!(sql, @"SELECT bla.id AS id_renamed, bla.first_name FROM person AS bla WHERE (bla.id > 5)");
+
+    Ok(())
+}
+
+/// Computed expression in the inner projection, referenced through a subquery alias.
+/// Tests both layered and merged (pushed-down) variants.
+///
+/// Layered: Projection → SubqueryAlias("sub") → Projection(computed) → TableScan(person, filter)
+/// Merged:  Projection(computed) → TableScan(person, filter)
+#[test]
+fn test_unparse_projection_subquery_with_computed_expr() -> Result<()> {
+    let context = MockContextProvider {
+        state: MockSessionState::default(),
+    };
+    let person_schema = context
+        .get_table_source(TableReference::bare("person"))?
+        .schema();
+
+    let scan = table_scan_with_filters(
+        Some("person"),
+        &person_schema,
+        Some(vec![0, 1, 3]),
+        vec![col("person.age").gt(lit(18))],
+    )?
+    .build()?;
+
+    // --- Layered: outer Projection → SubqueryAlias → inner Projection → scan ---
+    let layered = LogicalPlanBuilder::from(scan.clone())
+        .project(vec![
+            (col("person.id") + lit(1u32)).alias("id_plus"),
+            col("person.first_name"),
+        ])?
+        .alias("sub")?
+        .project(vec![col("sub.id_plus"), col("sub.first_name")])?
+        .build()?;
+
+    let layered_sql = Unparser::default().plan_to_sql(&layered)?.to_string();
+    insta::assert_snapshot!(layered_sql, @"SELECT sub.id_plus, sub.first_name FROM (SELECT (sub.id + 1) AS id_plus, sub.first_name FROM person AS sub WHERE (sub.age > 18)) AS sub");
+
+    // --- Merged: single Projection → scan (push outer into inner) ---
+    let merged = LogicalPlanBuilder::from(scan)
+        .project(vec![
+            (col("person.id") + lit(1u32)).alias("id_plus"),
+            col("person.first_name"),
+        ])?
+        .build()?;
+
+    let merged_sql = Unparser::default().plan_to_sql(&merged)?.to_string();
+    insta::assert_snapshot!(merged_sql, @"SELECT (person.id + 1) AS id_plus, person.first_name FROM person WHERE (person.age > 18)");
+
+    Ok(())
+}
+
 /// Test that unparsing a manually constructed join with a subquery aggregate
 /// preserves the MAX aggregate function.
 ///

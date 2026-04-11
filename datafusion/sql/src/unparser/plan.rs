@@ -230,12 +230,14 @@ impl Unparser<'_> {
     /// Reconstructs a SELECT SQL statement from a logical plan by unprojecting column expressions
     /// found in a [Projection] node. This requires scanning the plan tree for relevant Aggregate
     /// and Window nodes and matching column expressions to the appropriate agg or window expressions.
+    ///
+    /// Returns `true` if an Aggregate node was found and claimed for this SELECT.
     fn reconstruct_select_statement(
         &self,
         plan: &LogicalPlan,
         p: &Projection,
         select: &mut SelectBuilder,
-    ) -> Result<()> {
+    ) -> Result<bool> {
         let mut exprs = p.expr.clone();
 
         // If an Unnest node is found within the select, find and unproject the unnest column
@@ -281,6 +283,7 @@ impl Unparser<'_> {
                         .collect::<Result<Vec<_>>>()?,
                     vec![],
                 ));
+                Ok(true)
             }
             (None, Some(window)) => {
                 let items = exprs
@@ -292,6 +295,7 @@ impl Unparser<'_> {
                     .collect::<Result<Vec<_>>>()?;
 
                 select.projection(items);
+                Ok(false)
             }
             _ => {
                 let use_flatten = self.dialect.unnest_as_lateral_flatten();
@@ -325,9 +329,9 @@ impl Unparser<'_> {
                     })
                     .collect::<Result<Vec<_>>>()?;
                 select.projection(items);
+                Ok(false)
             }
         }
-        Ok(())
     }
 
     fn derive(
@@ -569,7 +573,76 @@ impl Unparser<'_> {
                         columns,
                     );
                 }
-                self.reconstruct_select_statement(plan, p, select)?;
+                let found_agg = self.reconstruct_select_statement(plan, p, select)?;
+
+                // If the Projection claimed an Aggregate by reaching through
+                // a Limit or Sort, fold those clauses into the current query
+                // and skip the node during recursion. Otherwise the Limit/Sort
+                // arm would see `already_projected` and wrap everything in a
+                // spurious derived subquery.
+                if found_agg {
+                    if let LogicalPlan::Limit(limit) = p.input.as_ref() {
+                        if let Some(fetch) = &limit.fetch {
+                            let Some(query) = query.as_mut() else {
+                                return internal_err!(
+                                    "Limit operator only valid in a statement context."
+                                );
+                            };
+                            query.limit(Some(self.expr_to_sql(fetch)?));
+                        }
+                        if let Some(skip) = &limit.skip {
+                            let Some(query) = query.as_mut() else {
+                                return internal_err!(
+                                    "Offset operator only valid in a statement context."
+                                );
+                            };
+                            query.offset(Some(ast::Offset {
+                                rows: ast::OffsetRows::None,
+                                value: self.expr_to_sql(skip)?,
+                            }));
+                        }
+                        return self.select_to_sql_recursively(
+                            limit.input.as_ref(),
+                            query,
+                            select,
+                            relation,
+                        );
+                    }
+                    if let LogicalPlan::Sort(sort) = p.input.as_ref() {
+                        let Some(query_ref) = query.as_mut() else {
+                            return internal_err!(
+                                "Sort operator only valid in a statement context."
+                            );
+                        };
+                        if let Some(fetch) = sort.fetch {
+                            query_ref.limit(Some(ast::Expr::value(ast::Value::Number(
+                                fetch.to_string(),
+                                false,
+                            ))));
+                        }
+                        let agg =
+                            find_agg_node_within_select(plan, select.already_projected());
+                        let sort_exprs: Vec<SortExpr> = sort
+                            .expr
+                            .iter()
+                            .map(|sort_expr| {
+                                unproject_sort_expr(
+                                    sort_expr.clone(),
+                                    agg,
+                                    sort.input.as_ref(),
+                                )
+                            })
+                            .collect::<Result<Vec<_>>>()?;
+                        query_ref.order_by(self.sorts_to_sql(&sort_exprs)?);
+                        return self.select_to_sql_recursively(
+                            sort.input.as_ref(),
+                            query,
+                            select,
+                            relation,
+                        );
+                    }
+                }
+
                 self.select_to_sql_recursively(p.input.as_ref(), query, select, relation)
             }
             LogicalPlan::Filter(filter) => {
