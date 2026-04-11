@@ -39,7 +39,7 @@ use datafusion_sql::planner::{ContextProvider, PlannerContext, SqlToRel};
 use datafusion_sql::unparser::dialect::{
     BigQueryDialect, CustomDialectBuilder, DefaultDialect as UnparserDefaultDialect,
     DefaultDialect, Dialect as UnparserDialect, MySqlDialect as UnparserMySqlDialect,
-    PostgreSqlDialect as UnparserPostgreSqlDialect, SqliteDialect,
+    PostgreSqlDialect as UnparserPostgreSqlDialect, SnowflakeDialect, SqliteDialect,
 };
 use datafusion_sql::unparser::{Unparser, expr_to_sql, plan_to_sql};
 use insta::assert_snapshot;
@@ -2993,5 +2993,42 @@ fn test_unparse_manual_join_with_subquery_aggregate() -> Result<()> {
         "Unparsed SQL should preserve the MAX aggregate function call, got: {sql}"
     );
 
+    Ok(())
+}
+
+#[test]
+fn snowflake_unnest_to_lateral_flatten_simple() -> Result<(), DataFusionError> {
+    let snowflake = SnowflakeDialect::new();
+    roundtrip_statement_with_dialect_helper!(
+        sql: "SELECT * FROM UNNEST([1,2,3])",
+        parser_dialect: GenericDialect {},
+        unparser_dialect: snowflake,
+        expected: @r#"SELECT _unnest."VALUE" FROM LATERAL FLATTEN(INPUT => [1, 2, 3]) AS _unnest"#,
+    );
+    Ok(())
+}
+
+#[test]
+fn snowflake_unnest_to_lateral_flatten_with_cross_join() -> Result<(), DataFusionError>
+{
+    let snowflake = SnowflakeDialect::new();
+    roundtrip_statement_with_dialect_helper!(
+        sql: "SELECT * FROM UNNEST([1,2,3]), j1",
+        parser_dialect: GenericDialect {},
+        unparser_dialect: snowflake,
+        expected: @r#"SELECT _unnest."VALUE", "j1"."j1_id", "j1"."j1_string" FROM LATERAL FLATTEN(INPUT => [1, 2, 3]) AS _unnest CROSS JOIN "j1""#,
+    );
+    Ok(())
+}
+
+#[test]
+fn snowflake_unnest_to_lateral_flatten_outer_ref() -> Result<(), DataFusionError> {
+    let snowflake = SnowflakeDialect::new();
+    roundtrip_statement_with_dialect_helper!(
+        sql: "SELECT * FROM unnest_table u, UNNEST(u.array_col)",
+        parser_dialect: GenericDialect {},
+        unparser_dialect: snowflake,
+        expected: @r#"SELECT "u"."array_col", "u"."struct_col", _unnest."VALUE" FROM "unnest_table" AS "u" CROSS JOIN LATERAL FLATTEN(INPUT => "u"."array_col") AS _unnest"#,
+    );
     Ok(())
 }
