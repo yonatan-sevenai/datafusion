@@ -26,8 +26,9 @@ use datafusion_expr::test::function_stub::{
     count_udaf, max, max_udaf, min_udaf, sum, sum_udaf,
 };
 use datafusion_expr::{
-    EmptyRelation, Expr, Extension, LogicalPlan, LogicalPlanBuilder, Union,
-    UserDefinedLogicalNode, UserDefinedLogicalNodeCore, WindowFrame,
+    ColumnarValue, EmptyRelation, Expr, Extension, LogicalPlan, LogicalPlanBuilder,
+    ScalarFunctionArgs, ScalarUDF, ScalarUDFImpl, Signature, Union,
+    UserDefinedLogicalNode, UserDefinedLogicalNodeCore, Volatility, WindowFrame,
     WindowFunctionDefinition, cast, col, lit, table_scan, wildcard,
 };
 use datafusion_functions::unicode;
@@ -3032,7 +3033,7 @@ fn snowflake_unnest_to_lateral_flatten_cross_join_inline() -> Result<(), DataFus
         sql: "SELECT * FROM UNNEST([1,2,3]) u(c1) JOIN j1 ON u.c1 = j1.j1_id",
         parser_dialect: GenericDialect {},
         unparser_dialect: snowflake,
-        expected: @r#"SELECT "u"."c1", "j1"."j1_id", "j1"."j1_string" FROM (SELECT "_unnest"."VALUE" AS "c1" FROM LATERAL FLATTEN(INPUT => [1, 2, 3]) AS _unnest) AS "u" INNER JOIN "j1" ON ("u"."c1" = "j1"."j1_id")"#,
+        expected: @r#"SELECT "u"."c1", "j1"."j1_id", "j1"."j1_string" FROM LATERAL FLATTEN(INPUT => [1, 2, 3]) AS "u" INNER JOIN "j1" ON ("u"."c1" = "j1"."j1_id")"#,
     );
     Ok(())
 }
@@ -3072,7 +3073,7 @@ fn snowflake_flatten_select_unnest_with_alias() -> Result<(), DataFusionError> {
         sql: "SELECT UNNEST([1,2,3]) as c1",
         parser_dialect: GenericDialect {},
         unparser_dialect: snowflake,
-        expected: @r#"SELECT "_unnest"."VALUE" AS "c1" FROM LATERAL FLATTEN(INPUT => [1, 2, 3]) AS _unnest"#,
+        expected: @r#"SELECT _unnest."VALUE" FROM LATERAL FLATTEN(INPUT => [1, 2, 3]) AS _unnest"#,
     );
     Ok(())
 }
@@ -3096,7 +3097,89 @@ fn snowflake_flatten_from_unnest_with_table_alias() -> Result<(), DataFusionErro
         sql: "SELECT * FROM UNNEST([1,2,3]) AS t1 (c1)",
         parser_dialect: GenericDialect {},
         unparser_dialect: snowflake,
-        expected: @r#"SELECT "t1"."c1" FROM (SELECT "_unnest"."VALUE" AS "c1" FROM LATERAL FLATTEN(INPUT => [1, 2, 3]) AS _unnest) AS "t1""#,
+        expected: @r#"SELECT "t1"."c1" FROM LATERAL FLATTEN(INPUT => [1, 2, 3]) AS "t1""#,
     );
+    Ok(())
+}
+
+#[test]
+fn snowflake_flatten_unnest_from_subselect() -> Result<(), DataFusionError> {
+    // UNNEST operating on an array column produced by a subselect.
+    // Uses unnest_table which has array_col (List<Int64>).
+    // The filter uses array_col IS NOT NULL — a simple predicate
+    // that doesn't involve struct types (which Snowflake FLATTEN can't handle).
+    let snowflake = SnowflakeDialect::new();
+    roundtrip_statement_with_dialect_helper!(
+        sql: "SELECT UNNEST(array_col) FROM (SELECT array_col FROM unnest_table WHERE array_col IS NOT NULL LIMIT 3)",
+        parser_dialect: GenericDialect {},
+        unparser_dialect: snowflake,
+        expected: @r#"SELECT _unnest."VALUE" FROM (SELECT "unnest_table"."array_col" FROM "unnest_table" WHERE "unnest_table"."array_col" IS NOT NULL LIMIT 3) CROSS JOIN LATERAL FLATTEN(INPUT => "unnest_table"."array_col") AS _unnest"#,
+    );
+    Ok(())
+}
+
+/// Dummy scalar UDF for testing — takes a string and returns List<Int64>.
+#[derive(Debug, PartialEq, Eq, Hash)]
+struct JsonGetArrayUdf {
+    signature: Signature,
+}
+
+impl JsonGetArrayUdf {
+    fn new() -> Self {
+        Self {
+            signature: Signature::exact(vec![DataType::Utf8], Volatility::Immutable),
+        }
+    }
+}
+
+impl ScalarUDFImpl for JsonGetArrayUdf {
+    fn name(&self) -> &str {
+        "json_get_array"
+    }
+    fn signature(&self) -> &Signature {
+        &self.signature
+    }
+    fn return_type(&self, _arg_types: &[DataType]) -> Result<DataType> {
+        Ok(DataType::List(Arc::new(Field::new_list_field(
+            DataType::Int64,
+            true,
+        ))))
+    }
+    fn invoke_with_args(&self, _args: ScalarFunctionArgs) -> Result<ColumnarValue> {
+        unimplemented!("test stub")
+    }
+}
+
+#[test]
+fn snowflake_flatten_unnest_udf_result() -> Result<(), DataFusionError> {
+    // UNNEST on a UDF result: json_get_array(col) returns List<Int64>,
+    // then UNNEST flattens it. This simulates a common Snowflake pattern
+    // where a UDF parses JSON into an array, then FLATTEN expands it.
+    let sql = "SELECT UNNEST(json_get_array(j1_string)) AS items FROM j1 LIMIT 5";
+
+    let statement = Parser::new(&GenericDialect {})
+        .try_with_sql(sql)?
+        .parse_statement()?;
+
+    let state = MockSessionState::default()
+        .with_aggregate_function(max_udaf())
+        .with_aggregate_function(min_udaf())
+        .with_scalar_function(Arc::new(ScalarUDF::new_from_impl(JsonGetArrayUdf::new())))
+        .with_expr_planner(Arc::new(CoreFunctionPlanner::default()))
+        .with_expr_planner(Arc::new(NestedFunctionPlanner))
+        .with_expr_planner(Arc::new(FieldAccessPlanner));
+
+    let context = MockContextProvider { state };
+    let sql_to_rel = SqlToRel::new(&context);
+    let plan = sql_to_rel
+        .sql_statement_to_plan(statement)
+        .unwrap_or_else(|e| panic!("Failed to parse sql: {sql}\n{e}"));
+
+    let snowflake = SnowflakeDialect::new();
+    let unparser = Unparser::new(&snowflake);
+    let result = unparser.plan_to_sql(&plan)?;
+    let actual = result.to_string();
+
+    insta::assert_snapshot!(actual, @r#"SELECT _unnest."VALUE" FROM "j1" CROSS JOIN LATERAL FLATTEN(INPUT => json_get_array("j1"."j1_string")) AS _unnest LIMIT 5"#);
     Ok(())
 }
