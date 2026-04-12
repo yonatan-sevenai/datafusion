@@ -3335,7 +3335,7 @@ fn snowflake_flatten_select_unnest_with_alias() -> Result<(), DataFusionError> {
         sql: "SELECT UNNEST([1,2,3]) as c1",
         parser_dialect: GenericDialect {},
         unparser_dialect: snowflake,
-        expected: @r#"SELECT _unnest."VALUE" FROM LATERAL FLATTEN(INPUT => [1, 2, 3]) AS _unnest"#,
+        expected: @r#"SELECT _unnest."VALUE" AS "c1" FROM LATERAL FLATTEN(INPUT => [1, 2, 3]) AS _unnest"#,
     );
     Ok(())
 }
@@ -3442,7 +3442,7 @@ fn snowflake_flatten_unnest_udf_result() -> Result<(), DataFusionError> {
     let result = unparser.plan_to_sql(&plan)?;
     let actual = result.to_string();
 
-    insta::assert_snapshot!(actual, @r#"SELECT _unnest."VALUE" FROM "j1" CROSS JOIN LATERAL FLATTEN(INPUT => json_get_array("j1"."j1_string")) AS _unnest LIMIT 5"#);
+    insta::assert_snapshot!(actual, @r#"SELECT _unnest."VALUE" AS "items" FROM "j1" CROSS JOIN LATERAL FLATTEN(INPUT => json_get_array("j1"."j1_string")) AS _unnest LIMIT 5"#);
     Ok(())
 }
 
