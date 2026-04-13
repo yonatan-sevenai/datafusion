@@ -3623,6 +3623,87 @@ fn snowflake_flatten_composed_expression_with_limit() -> Result<(), DataFusionEr
 }
 
 #[test]
+fn snowflake_flatten_multi_expression_projection() -> Result<(), DataFusionError> {
+    // Build: Projection([CAST(placeholder AS Int64) AS a, CAST(placeholder AS Utf8) AS b])
+    //          → Unnest → Projection → TableScan
+    // The outer Projection has TWO expressions — both reference the placeholder.
+    // The FLATTEN code path must fire even when p.expr.len() > 1.
+    let schema = Schema::new(vec![Field::new(
+        "items",
+        DataType::List(Arc::new(Field::new_list_field(DataType::Utf8, true))),
+        true,
+    )]);
+
+    let plan = table_scan(Some("source"), &schema, None)?
+        .project(vec![col("items").alias("__unnest_placeholder(items)")])?
+        .unnest_column("__unnest_placeholder(items)")?
+        .project(vec![
+            cast(col("__unnest_placeholder(items)"), DataType::Int64).alias("a"),
+            cast(col("__unnest_placeholder(items)"), DataType::Utf8).alias("b"),
+        ])?
+        .build()?;
+
+    let snowflake = SnowflakeDialect::new();
+    let unparser = Unparser::new(&snowflake);
+    let result = unparser.plan_to_sql(&plan)?;
+    let actual = result.to_string();
+
+    assert!(
+        actual.contains("LATERAL FLATTEN"),
+        "Expected LATERAL FLATTEN in SQL, got: {actual}"
+    );
+    // Both expressions should be present
+    assert!(
+        actual.contains("CAST"),
+        "Expected CAST in SQL, got: {actual}"
+    );
+    assert!(
+        actual.contains(r#"AS "a""#),
+        "Expected alias 'a' in SQL, got: {actual}"
+    );
+    assert!(
+        actual.contains(r#"AS "b""#),
+        "Expected alias 'b' in SQL, got: {actual}"
+    );
+    Ok(())
+}
+
+#[test]
+fn snowflake_flatten_multi_expression_with_limit() -> Result<(), DataFusionError> {
+    // Multi-expression + Limit between Projection and Unnest
+    let schema = Schema::new(vec![Field::new(
+        "items",
+        DataType::List(Arc::new(Field::new_list_field(DataType::Utf8, true))),
+        true,
+    )]);
+
+    let plan = table_scan(Some("source"), &schema, None)?
+        .project(vec![col("items").alias("__unnest_placeholder(items)")])?
+        .unnest_column("__unnest_placeholder(items)")?
+        .limit(0, Some(10))?
+        .project(vec![
+            cast(col("__unnest_placeholder(items)"), DataType::Int64).alias("a"),
+            cast(col("__unnest_placeholder(items)"), DataType::Utf8).alias("b"),
+        ])?
+        .build()?;
+
+    let snowflake = SnowflakeDialect::new();
+    let unparser = Unparser::new(&snowflake);
+    let result = unparser.plan_to_sql(&plan)?;
+    let actual = result.to_string();
+
+    assert!(
+        actual.contains("LATERAL FLATTEN"),
+        "Expected LATERAL FLATTEN in SQL, got: {actual}"
+    );
+    assert!(
+        actual.contains("LIMIT 10"),
+        "Expected LIMIT 10 in SQL, got: {actual}"
+    );
+    Ok(())
+}
+
+#[test]
 fn snowflake_unnest_through_subquery_alias() -> Result<(), DataFusionError> {
     // Build: Projection → Unnest → SubqueryAlias → Projection → TableScan
     // This simulates the plan produced when a virtual/passthrough table
