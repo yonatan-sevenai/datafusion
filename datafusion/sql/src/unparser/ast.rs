@@ -769,7 +769,7 @@ impl FlattenRelationBuilder {
     fn create_empty() -> Self {
         Self {
             alias: Some(ast::TableAlias {
-                name: ast::Ident::new(FLATTEN_DEFAULT_ALIAS),
+                name: ast::Ident::with_quote('"', FLATTEN_DEFAULT_ALIAS),
                 columns: vec![],
                 explicit: true,
             }),
