@@ -441,7 +441,7 @@ impl Unparser<'_> {
                 };
                 if self.dialect.unnest_as_lateral_flatten()
                     && unnest_input_type.is_some()
-                    && let LogicalPlan::Unnest(unnest) = p.input.as_ref()
+                    && let Some(unnest) = Self::peel_to_unnest(p.input.as_ref())
                     && let Some(flatten_relation) =
                         self.try_unnest_to_lateral_flatten_sql(unnest)?
                 {
@@ -449,22 +449,23 @@ impl Unparser<'_> {
 
                     // Check if the Unnest source is a real query (subselect)
                     // vs an inline array (EmptyRelation).
-                    let inner_projection = match unnest.input.as_ref() {
-                        LogicalPlan::Projection(proj) => proj,
-                        LogicalPlan::SubqueryAlias(alias) => match alias.input.as_ref() {
-                            LogicalPlan::Projection(proj) => proj,
-                            other => {
-                                return internal_err!(
-                                    "Unnest input (through SubqueryAlias) is not a Projection: {other:?}"
-                                );
-                            }
-                        },
-                        other => {
-                            return internal_err!(
-                                "Unnest input is not a Projection: {other:?}"
-                            );
-                        }
-                    };
+                    let inner_projection =
+                        Self::peel_to_inner_projection(unnest.input.as_ref())
+                            .ok_or_else(|| {
+                                DataFusionError::Internal(format!(
+                                    "Unnest input is not a Projection: {:?}",
+                                    unnest.input
+                                ))
+                            })?;
+
+                    // Apply any intermediate Limit/Sort modifiers and get
+                    // a reference to the Unnest LogicalPlan node for recursion.
+                    // This bypasses the Limit/Sort handlers (which would create
+                    // unwanted derived subqueries when already_projected is set).
+                    let unnest_plan = self.apply_transparent_and_find_unnest_plan(
+                        p.input.as_ref(),
+                        query,
+                    )?;
 
                     if matches!(
                         inner_projection.input.as_ref(),
@@ -483,7 +484,7 @@ impl Unparser<'_> {
                         }
 
                         return self.select_to_sql_recursively(
-                            p.input.as_ref(),
+                            unnest_plan,
                             query,
                             select,
                             relation,
@@ -522,12 +523,7 @@ impl Unparser<'_> {
                     // Recurse into the Unnest → inner source to set the primary
                     // relation (table scan, subquery, etc.), then add FLATTEN
                     // as a CROSS JOIN.
-                    self.select_to_sql_recursively(
-                        p.input.as_ref(),
-                        query,
-                        select,
-                        relation,
-                    )?;
+                    self.select_to_sql_recursively(unnest_plan, query, select, relation)?;
 
                     let flatten_factor = flatten.build().map_err(|e| {
                         DataFusionError::Internal(format!("Failed to build FLATTEN: {e}"))
@@ -554,13 +550,17 @@ impl Unparser<'_> {
                 if self.dialect.unnest_as_table_factor()
                     && unnest_input_type.is_some()
                     && user_alias.is_none() // Skip if user alias present — fall through to reconstruct_select_statement which preserves aliases
-                    && let LogicalPlan::Unnest(unnest) = &p.input.as_ref()
+                    && let Some(unnest) = Self::peel_to_unnest(p.input.as_ref())
                     && let Some(unnest_relation) =
                         self.try_unnest_to_table_factor_sql(unnest)?
                 {
                     relation.unnest(unnest_relation);
-                    return self.select_to_sql_recursively(
+                    let unnest_plan = self.apply_transparent_and_find_unnest_plan(
                         p.input.as_ref(),
+                        query,
+                    )?;
+                    return self.select_to_sql_recursively(
+                        unnest_plan,
                         query,
                         select,
                         relation,
@@ -1274,13 +1274,9 @@ impl Unparser<'_> {
                 // |     Projection: table.col1, table.col2 AS UNNEST(table.col2)
                 // |       Filter: table.col3 = Int64(3)
                 // |         TableScan: table projection=None
-                if let LogicalPlan::Projection(p) = unnest.input.as_ref() {
-                    // continue with projection input
-                    self.select_to_sql_recursively(&p.input, query, select, relation)
-                } else if let LogicalPlan::SubqueryAlias(alias) = unnest.input.as_ref()
-                    && let LogicalPlan::Projection(p) = alias.input.as_ref()
-                {
-                    // SubqueryAlias wraps the Projection (e.g. passthrough tables)
+                if let Some(p) = Self::peel_to_inner_projection(unnest.input.as_ref()) {
+                    // Skip the inner Projection (synthetic rewriter node)
+                    // and continue with its input.
                     self.select_to_sql_recursively(&p.input, query, select, relation)
                 } else {
                     internal_err!("Unnest input is not a Projection: {unnest:?}")
@@ -1311,6 +1307,96 @@ impl Unparser<'_> {
             }
             _ => {
                 not_impl_err!("Unsupported operator: {plan:?}")
+            }
+        }
+    }
+
+    /// Walk through "transparent" plan nodes (Limit, Sort) to find an Unnest.
+    ///
+    /// The DataFusion optimizer may insert Limit or Sort between the outer
+    /// Projection and the Unnest node. These nodes modify result quantity or
+    /// ordering but do not change the plan shape for unnest detection. The
+    /// normal recursion in [`Self::select_to_sql_recursively`] handles their
+    /// SQL rendering (LIMIT/OFFSET/ORDER BY); this helper only needs to
+    /// locate the Unnest so the FLATTEN / table-factor code path can fire.
+    fn peel_to_unnest(plan: &LogicalPlan) -> Option<&Unnest> {
+        match plan {
+            LogicalPlan::Unnest(unnest) => Some(unnest),
+            LogicalPlan::Limit(limit) => Self::peel_to_unnest(limit.input.as_ref()),
+            LogicalPlan::Sort(sort) => Self::peel_to_unnest(sort.input.as_ref()),
+            _ => None,
+        }
+    }
+
+    /// Walk through "transparent" plan nodes (SubqueryAlias, Limit, Sort) to
+    /// find the inner Projection that feeds an Unnest node.
+    ///
+    /// The inner Projection is created by the `RecursiveUnnestRewriter` and
+    /// contains the array expression that the Unnest operates on. A
+    /// `SubqueryAlias` (e.g. from a virtual/passthrough table) may wrap the
+    /// Projection; Limit/Sort are also handled for robustness.
+    fn peel_to_inner_projection(plan: &LogicalPlan) -> Option<&Projection> {
+        match plan {
+            LogicalPlan::Projection(p) => Some(p),
+            LogicalPlan::SubqueryAlias(alias) => {
+                Self::peel_to_inner_projection(alias.input.as_ref())
+            }
+            LogicalPlan::Limit(limit) => {
+                Self::peel_to_inner_projection(limit.input.as_ref())
+            }
+            LogicalPlan::Sort(sort) => {
+                Self::peel_to_inner_projection(sort.input.as_ref())
+            }
+            _ => None,
+        }
+    }
+
+    /// Walk through transparent nodes (Limit, Sort) between the outer
+    /// Projection and the Unnest, applying their SQL modifiers (LIMIT,
+    /// OFFSET, ORDER BY) to the query builder. Returns a reference to the
+    /// Unnest `LogicalPlan` node so the caller can recurse into it directly,
+    /// bypassing the intermediate handlers that would otherwise create
+    /// unwanted derived subqueries.
+    fn apply_transparent_and_find_unnest_plan<'a>(
+        &self,
+        plan: &'a LogicalPlan,
+        query: &mut Option<QueryBuilder>,
+    ) -> Result<&'a LogicalPlan> {
+        match plan {
+            LogicalPlan::Unnest(_) => Ok(plan),
+            LogicalPlan::Limit(limit) => {
+                if let Some(fetch) = &limit.fetch
+                    && let Some(q) = query.as_mut()
+                {
+                    q.limit(Some(self.expr_to_sql(fetch)?));
+                }
+                if let Some(skip) = &limit.skip
+                    && let Some(q) = query.as_mut()
+                {
+                    q.offset(Some(ast::Offset {
+                        rows: ast::OffsetRows::None,
+                        value: self.expr_to_sql(skip)?,
+                    }));
+                }
+                self.apply_transparent_and_find_unnest_plan(limit.input.as_ref(), query)
+            }
+            LogicalPlan::Sort(sort) => {
+                let Some(query_ref) = query.as_mut() else {
+                    return internal_err!(
+                        "Sort between Projection and Unnest requires a statement context."
+                    );
+                };
+                if let Some(fetch) = sort.fetch {
+                    query_ref.limit(Some(ast::Expr::value(ast::Value::Number(
+                        fetch.to_string(),
+                        false,
+                    ))));
+                }
+                query_ref.order_by(self.sorts_to_sql(&sort.expr)?);
+                self.apply_transparent_and_find_unnest_plan(sort.input.as_ref(), query)
+            }
+            other => {
+                internal_err!("Unexpected node between Projection and Unnest: {other:?}")
             }
         }
     }
@@ -1411,16 +1497,9 @@ impl Unparser<'_> {
         &self,
         unnest: &Unnest,
     ) -> Result<Option<FlattenRelationBuilder>> {
-        let projection = match unnest.input.as_ref() {
-            LogicalPlan::Projection(p) => p,
-            LogicalPlan::SubqueryAlias(alias) => {
-                if let LogicalPlan::Projection(p) = alias.input.as_ref() {
-                    p
-                } else {
-                    return Ok(None);
-                }
-            }
-            _ => return Ok(None),
+        let Some(projection) = Self::peel_to_inner_projection(unnest.input.as_ref())
+        else {
+            return Ok(None);
         };
 
         // For now, handle the simple case of a single expression to flatten.
