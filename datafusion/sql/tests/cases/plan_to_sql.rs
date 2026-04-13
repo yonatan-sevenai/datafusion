@@ -3381,12 +3381,14 @@ fn snowflake_flatten_unnest_from_subselect() -> Result<(), DataFusionError> {
 }
 
 /// Dummy scalar UDF for testing — takes a string and returns List<Int64>.
+/// Simulates any UDF that extracts an array from a column (e.g. parsing
+/// JSON, splitting a delimited string, etc.).
 #[derive(Debug, PartialEq, Eq, Hash)]
-struct JsonGetArrayUdf {
+struct ExtractArrayUdf {
     signature: Signature,
 }
 
-impl JsonGetArrayUdf {
+impl ExtractArrayUdf {
     fn new() -> Self {
         Self {
             signature: Signature::exact(vec![DataType::Utf8], Volatility::Immutable),
@@ -3394,9 +3396,9 @@ impl JsonGetArrayUdf {
     }
 }
 
-impl ScalarUDFImpl for JsonGetArrayUdf {
+impl ScalarUDFImpl for ExtractArrayUdf {
     fn name(&self) -> &str {
-        "json_get_array"
+        "extract_array"
     }
     fn signature(&self) -> &Signature {
         &self.signature
@@ -3414,10 +3416,10 @@ impl ScalarUDFImpl for JsonGetArrayUdf {
 
 #[test]
 fn snowflake_flatten_unnest_udf_result() -> Result<(), DataFusionError> {
-    // UNNEST on a UDF result: json_get_array(col) returns List<Int64>,
-    // then UNNEST flattens it. This simulates a common Snowflake pattern
-    // where a UDF parses JSON into an array, then FLATTEN expands it.
-    let sql = "SELECT UNNEST(json_get_array(j1_string)) AS items FROM j1 LIMIT 5";
+    // UNNEST on a UDF result: extract_array(col) returns List<Int64>,
+    // then UNNEST flattens it. This exercises the path where the FLATTEN
+    // INPUT is a UDF call rather than a bare column reference.
+    let sql = "SELECT UNNEST(extract_array(j1_string)) AS items FROM j1 LIMIT 5";
 
     let statement = Parser::new(&GenericDialect {})
         .try_with_sql(sql)?
@@ -3426,7 +3428,7 @@ fn snowflake_flatten_unnest_udf_result() -> Result<(), DataFusionError> {
     let state = MockSessionState::default()
         .with_aggregate_function(max_udaf())
         .with_aggregate_function(min_udaf())
-        .with_scalar_function(Arc::new(ScalarUDF::new_from_impl(JsonGetArrayUdf::new())))
+        .with_scalar_function(Arc::new(ScalarUDF::new_from_impl(ExtractArrayUdf::new())))
         .with_expr_planner(Arc::new(CoreFunctionPlanner::default()))
         .with_expr_planner(Arc::new(NestedFunctionPlanner))
         .with_expr_planner(Arc::new(FieldAccessPlanner));
@@ -3442,7 +3444,7 @@ fn snowflake_flatten_unnest_udf_result() -> Result<(), DataFusionError> {
     let result = unparser.plan_to_sql(&plan)?;
     let actual = result.to_string();
 
-    insta::assert_snapshot!(actual, @r#"SELECT "_unnest"."VALUE" AS "items" FROM "j1" CROSS JOIN LATERAL FLATTEN(INPUT => json_get_array("j1"."j1_string")) AS "_unnest" LIMIT 5"#);
+    insta::assert_snapshot!(actual, @r#"SELECT "_unnest"."VALUE" AS "items" FROM "j1" CROSS JOIN LATERAL FLATTEN(INPUT => extract_array("j1"."j1_string")) AS "_unnest" LIMIT 5"#);
     Ok(())
 }
 
