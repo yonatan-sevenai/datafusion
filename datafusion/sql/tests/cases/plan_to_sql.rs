@@ -3185,6 +3185,105 @@ fn snowflake_flatten_unnest_udf_result() -> Result<(), DataFusionError> {
 }
 
 #[test]
+fn snowflake_flatten_limit_between_projection_and_unnest() -> Result<(), DataFusionError>
+{
+    // Build: Projection → Limit → Unnest → Projection → TableScan
+    // The optimizer can insert a Limit between the outer Projection and the
+    // Unnest. The FLATTEN code path must look through transparent nodes
+    // (Limit, Sort) to find the Unnest.
+    let schema = Schema::new(vec![Field::new(
+        "items",
+        DataType::List(Arc::new(Field::new_list_field(DataType::Utf8, true))),
+        true,
+    )]);
+
+    let plan = table_scan(Some("source"), &schema, None)?
+        .project(vec![col("items").alias("__unnest_placeholder(items)")])?
+        .unnest_column("__unnest_placeholder(items)")?
+        .limit(0, Some(5))? // Limit BETWEEN outer Projection and Unnest
+        .project(vec![col("__unnest_placeholder(items)").alias("item")])?
+        .build()?;
+
+    let snowflake = SnowflakeDialect::new();
+    let unparser = Unparser::new(&snowflake);
+    let result = unparser.plan_to_sql(&plan)?;
+    let actual = result.to_string();
+
+    // Must contain LATERAL FLATTEN — the Limit must not prevent FLATTEN detection
+    insta::assert_snapshot!(actual, @r#"SELECT _unnest."VALUE" AS "item" FROM "source" CROSS JOIN LATERAL FLATTEN(INPUT => "source"."items", OUTER => true) AS _unnest LIMIT 5"#);
+    Ok(())
+}
+
+#[test]
+fn snowflake_flatten_sort_between_projection_and_unnest() -> Result<(), DataFusionError> {
+    // Build: Projection → Sort → Unnest → Projection → TableScan
+    // Same as Limit test but with Sort instead.
+    let schema = Schema::new(vec![Field::new(
+        "items",
+        DataType::List(Arc::new(Field::new_list_field(DataType::Utf8, true))),
+        true,
+    )]);
+
+    let plan = table_scan(Some("source"), &schema, None)?
+        .project(vec![col("items").alias("__unnest_placeholder(items)")])?
+        .unnest_column("__unnest_placeholder(items)")?
+        .sort(vec![col("__unnest_placeholder(items)").sort(true, true)])?
+        .project(vec![col("__unnest_placeholder(items)").alias("item")])?
+        .build()?;
+
+    let snowflake = SnowflakeDialect::new();
+    let unparser = Unparser::new(&snowflake);
+    let result = unparser.plan_to_sql(&plan)?;
+    let actual = result.to_string();
+
+    // Must contain LATERAL FLATTEN — the Sort must not prevent FLATTEN detection
+    assert!(
+        actual.contains("LATERAL FLATTEN"),
+        "Expected LATERAL FLATTEN in SQL, got: {actual}"
+    );
+    assert!(
+        actual.contains("ORDER BY"),
+        "Expected ORDER BY in SQL, got: {actual}"
+    );
+    Ok(())
+}
+
+#[test]
+fn snowflake_flatten_limit_between_projection_and_unnest_with_subquery_alias()
+-> Result<(), DataFusionError> {
+    // Build: Projection → Limit → Unnest → SubqueryAlias → Projection → TableScan
+    // Combines the Limit and SubqueryAlias transparent node patterns.
+    let schema = Schema::new(vec![Field::new(
+        "items",
+        DataType::List(Arc::new(Field::new_list_field(DataType::Utf8, true))),
+        true,
+    )]);
+
+    let plan = table_scan(Some("source"), &schema, None)?
+        .project(vec![col("items").alias("__unnest_placeholder(items)")])?
+        .alias("t")?
+        .unnest_column("__unnest_placeholder(items)")?
+        .limit(0, Some(10))?
+        .project(vec![col("__unnest_placeholder(items)").alias("item")])?
+        .build()?;
+
+    let snowflake = SnowflakeDialect::new();
+    let unparser = Unparser::new(&snowflake);
+    let result = unparser.plan_to_sql(&plan)?;
+    let actual = result.to_string();
+
+    assert!(
+        actual.contains("LATERAL FLATTEN"),
+        "Expected LATERAL FLATTEN in SQL, got: {actual}"
+    );
+    assert!(
+        actual.contains("LIMIT 10"),
+        "Expected LIMIT 10 in SQL, got: {actual}"
+    );
+    Ok(())
+}
+
+#[test]
 fn snowflake_unnest_through_subquery_alias() -> Result<(), DataFusionError> {
     // Build: Projection → Unnest → SubqueryAlias → Projection → TableScan
     // This simulates the plan produced when a virtual/passthrough table
