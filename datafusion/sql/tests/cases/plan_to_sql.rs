@@ -2997,12 +2997,9 @@ fn test_sort_on_aliased_column_dropped_by_outer_projection() -> Result<()> {
     let plan = table_scan(Some("phys_table"), &schema, None)?
         .alias("t")?
         .project(vec![
-            Expr::Column(Column::new(Some(TableReference::bare("t")), "X"))
-                .alias("a"),
-            Expr::Column(Column::new(Some(TableReference::bare("t")), "Y"))
-                .alias("b"),
-            Expr::Column(Column::new(Some(TableReference::bare("t")), "Z"))
-                .alias("c"),
+            Expr::Column(Column::new(Some(TableReference::bare("t")), "X")).alias("a"),
+            Expr::Column(Column::new(Some(TableReference::bare("t")), "Y")).alias("b"),
+            Expr::Column(Column::new(Some(TableReference::bare("t")), "Z")).alias("c"),
         ])?
         .sort_with_limit(
             vec![Expr::Column(Column::new_unqualified("c")).sort(false, true)],

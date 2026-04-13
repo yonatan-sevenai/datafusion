@@ -273,7 +273,9 @@ pub(super) fn rewrite_plan_for_sort_on_non_projected_fields(
             .expr
             .iter()
             .filter_map(|e| match e {
-                Expr::Alias(alias) if !projected_aliases.contains(alias.name.as_str()) => {
+                Expr::Alias(alias)
+                    if !projected_aliases.contains(alias.name.as_str()) =>
+                {
                     Some((alias.name.clone(), (*alias.expr).clone()))
                 }
                 _ => None,
