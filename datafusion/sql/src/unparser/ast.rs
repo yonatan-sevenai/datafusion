@@ -162,9 +162,52 @@ pub struct SelectBuilder {
     qualify: Option<ast::Expr>,
     value_table_mode: Option<ast::ValueTableMode>,
     flavor: Option<SelectFlavor>,
+    /// Counter for generating unique LATERAL FLATTEN aliases within this SELECT.
+    flatten_alias_counter: usize,
+    /// Table aliases that correspond to LATERAL FLATTEN relations.
+    /// Column references into these aliases must use `VALUE` as the column name.
+    flatten_table_aliases: Vec<String>,
 }
 
+/// Prefix used for auto-generated LATERAL FLATTEN table aliases.
+const FLATTEN_ALIAS_PREFIX: &str = "_unnest";
+
 impl SelectBuilder {
+    /// Generate a unique alias for a LATERAL FLATTEN relation
+    /// (`_unnest_1`, `_unnest_2`, …). Each call returns a fresh name.
+    pub fn next_flatten_alias(&mut self) -> String {
+        self.flatten_alias_counter += 1;
+        format!("{FLATTEN_ALIAS_PREFIX}_{}", self.flatten_alias_counter)
+    }
+
+    /// Register a table alias as pointing to a LATERAL FLATTEN relation.
+    pub fn add_flatten_table_alias(&mut self, alias: String) {
+        self.flatten_table_aliases.push(alias);
+    }
+
+    /// Returns true if no FLATTEN table aliases have been registered.
+    pub fn flatten_table_aliases_empty(&self) -> bool {
+        self.flatten_table_aliases.is_empty()
+    }
+
+    /// Returns true if the given table alias refers to a FLATTEN relation.
+    pub fn is_flatten_table_alias(&self, alias: &str) -> bool {
+        self.flatten_table_aliases.iter().any(|a| a == alias)
+    }
+
+    /// Returns the most recently generated flatten alias, or `None` if
+    /// `next_flatten_alias` has not been called yet.
+    pub fn current_flatten_alias(&self) -> Option<String> {
+        if self.flatten_alias_counter > 0 {
+            Some(format!(
+                "{FLATTEN_ALIAS_PREFIX}_{}",
+                self.flatten_alias_counter
+            ))
+        } else {
+            None
+        }
+    }
+
     pub fn distinct(&mut self, value: Option<ast::Distinct>) -> &mut Self {
         self.distinct = value;
         self
@@ -371,6 +414,8 @@ impl SelectBuilder {
             qualify: Default::default(),
             value_table_mode: Default::default(),
             flavor: Some(SelectFlavor::Standard),
+            flatten_alias_counter: 0,
+            flatten_table_aliases: Vec::new(),
         }
     }
 }
@@ -697,10 +742,6 @@ impl Default for UnnestRelationBuilder {
     }
 }
 
-/// Default table alias for FLATTEN table factors.
-/// Snowflake requires an alias to reference output columns (e.g. `_unnest.VALUE`).
-pub const FLATTEN_DEFAULT_ALIAS: &str = "_unnest";
-
 /// Builds a `LATERAL FLATTEN(INPUT => expr, OUTER => bool)` table factor
 /// for Snowflake-style unnesting.
 #[derive(Clone)]
@@ -757,22 +798,9 @@ impl FlattenRelationBuilder {
         })
     }
 
-    /// Returns the alias name for this FLATTEN relation.
-    /// Used to build qualified column references like `alias.VALUE`.
-    pub fn alias_name(&self) -> &str {
-        self.alias
-            .as_ref()
-            .map(|a| a.name.value.as_str())
-            .unwrap_or(FLATTEN_DEFAULT_ALIAS)
-    }
-
     fn create_empty() -> Self {
         Self {
-            alias: Some(ast::TableAlias {
-                name: ast::Ident::with_quote('"', FLATTEN_DEFAULT_ALIAS),
-                columns: vec![],
-                explicit: true,
-            }),
+            alias: None,
             input_expr: None,
             outer: false,
         }
