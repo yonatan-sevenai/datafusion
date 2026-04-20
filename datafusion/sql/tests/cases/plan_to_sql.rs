@@ -3242,7 +3242,7 @@ fn snowflake_flatten_sort_between_projection_and_unnest() -> Result<(), DataFusi
     let actual = result.to_string();
 
     // Must contain LATERAL FLATTEN — the Sort must not prevent FLATTEN detection
-    insta::assert_snapshot!(actual, @r#"SELECT "_unnest_1"."VALUE" AS "item" FROM "source" CROSS JOIN LATERAL FLATTEN(INPUT => "source"."items", OUTER => true) AS "_unnest_1" ORDER BY "__unnest_placeholder(items)" ASC NULLS FIRST"#);
+    insta::assert_snapshot!(actual, @r#"SELECT "_unnest_1"."VALUE" AS "item" FROM "source" CROSS JOIN LATERAL FLATTEN(INPUT => "source"."items", OUTER => true) AS "_unnest_1" ORDER BY "_unnest_1"."VALUE" ASC NULLS FIRST"#);
     Ok(())
 }
 

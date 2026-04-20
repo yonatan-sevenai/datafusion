@@ -401,13 +401,28 @@ impl Unparser<'_> {
         unnest_input_type: Option<&UnnestInputType>,
     ) -> Result<bool> {
         // unnest_as_lateral_flatten: Snowflake LATERAL FLATTEN
-        if self.dialect.unnest_as_lateral_flatten()
-            && unnest_input_type.is_some()
-            && let Some((unnest, unnest_plan)) =
-                self.peel_to_unnest_with_modifiers(p.input.as_ref(), query)?
-            && let Some(mut flatten) = self.try_unnest_to_lateral_flatten_sql(unnest)?
-        {
-            let inner_projection = Self::peel_to_inner_projection(unnest.input.as_ref())
+        //
+        // Generate the alias up front so that peel_to_unnest_with_modifiers
+        // can rewrite ORDER BY placeholder columns to alias.VALUE.
+        if self.dialect.unnest_as_lateral_flatten() && unnest_input_type.is_some() {
+            let flatten_alias_name = if !select.already_projected() {
+                select.next_flatten_alias()
+            } else {
+                select
+                    .current_flatten_alias()
+                    .unwrap_or_else(|| select.next_flatten_alias())
+            };
+
+            if let Some((unnest, unnest_plan)) = self.peel_to_unnest_with_modifiers(
+                p.input.as_ref(),
+                query,
+                Some(&flatten_alias_name),
+            )? && let Some(mut flatten) =
+                self.try_unnest_to_lateral_flatten_sql(unnest)?
+            {
+                let inner_projection = Self::peel_to_inner_projection(
+                    unnest.input.as_ref(),
+                )
                 .ok_or_else(|| {
                     internal_datafusion_err!(
                         "Unnest input is not a Projection: {:?}",
@@ -415,61 +430,48 @@ impl Unparser<'_> {
                     )
                 })?;
 
-            // Generate a unique alias for this FLATTEN so that
-            // multiple unnests in the same query don't collide.
-            // When the SELECT was already built by an outer Projection
-            // (already_projected), it already called
-            // next_flatten_alias(), so we reuse that alias.
-            if !select.already_projected() {
-                let flatten_alias_name = select.next_flatten_alias();
                 flatten.alias(Some(ast::TableAlias {
                     name: Ident::with_quote('"', &flatten_alias_name),
                     columns: vec![],
                     explicit: true,
                 }));
-                self.reconstruct_select_statement(plan, p, select)?;
-            } else if let Some(alias) = select.current_flatten_alias() {
-                flatten.alias(Some(ast::TableAlias {
-                    name: Ident::with_quote('"', &alias),
-                    columns: vec![],
-                    explicit: true,
-                }));
-            }
 
-            if matches!(
-                inner_projection.input.as_ref(),
-                LogicalPlan::EmptyRelation(_)
-            ) {
-                // Inline array (e.g. UNNEST([1,2,3])):
-                // FLATTEN is the sole FROM source.
-                relation.flatten(flatten);
+                if !select.already_projected() {
+                    self.reconstruct_select_statement(plan, p, select)?;
+                }
+
+                if matches!(
+                    inner_projection.input.as_ref(),
+                    LogicalPlan::EmptyRelation(_)
+                ) {
+                    relation.flatten(flatten);
+                    self.select_to_sql_recursively(unnest_plan, query, select, relation)?;
+                    return Ok(true);
+                }
+
                 self.select_to_sql_recursively(unnest_plan, query, select, relation)?;
+
+                let flatten_factor = flatten.build().map_err(|e| {
+                    internal_datafusion_err!("Failed to build FLATTEN: {e}")
+                })?;
+                let cross_join = ast::Join {
+                    relation: flatten_factor,
+                    global: false,
+                    join_operator: ast::JoinOperator::CrossJoin(
+                        ast::JoinConstraint::None,
+                    ),
+                };
+                if let Some(mut from) = select.pop_from() {
+                    from.push_join(cross_join);
+                    select.push_from(from);
+                } else {
+                    let mut twj = TableWithJoinsBuilder::default();
+                    twj.push_join(cross_join);
+                    select.push_from(twj);
+                }
+
                 return Ok(true);
             }
-
-            // Non-empty source (table, subquery, etc.):
-            // recurse to set the primary FROM, then attach FLATTEN
-            // as a CROSS JOIN.
-            self.select_to_sql_recursively(unnest_plan, query, select, relation)?;
-
-            let flatten_factor = flatten
-                .build()
-                .map_err(|e| internal_datafusion_err!("Failed to build FLATTEN: {e}"))?;
-            let cross_join = ast::Join {
-                relation: flatten_factor,
-                global: false,
-                join_operator: ast::JoinOperator::CrossJoin(ast::JoinConstraint::None),
-            };
-            if let Some(mut from) = select.pop_from() {
-                from.push_join(cross_join);
-                select.push_from(from);
-            } else {
-                let mut twj = TableWithJoinsBuilder::default();
-                twj.push_join(cross_join);
-                select.push_from(twj);
-            }
-
-            return Ok(true);
         }
 
         Ok(false)
@@ -537,7 +539,7 @@ impl Unparser<'_> {
                     && p.expr.len() == 1
                     && Self::is_bare_unnest_placeholder(&p.expr[0])
                     && let Some((unnest, unnest_plan)) =
-                        self.peel_to_unnest_with_modifiers(p.input.as_ref(), query)?
+                        self.peel_to_unnest_with_modifiers(p.input.as_ref(), query, None)?
                     && let Some(unnest_relation) =
                         self.try_unnest_to_table_factor_sql(unnest)?
                 {
@@ -1303,6 +1305,7 @@ impl Unparser<'_> {
         &self,
         plan: &'a LogicalPlan,
         query: &mut Option<QueryBuilder>,
+        flatten_alias: Option<&str>,
     ) -> Result<Option<(&'a Unnest, &'a LogicalPlan)>> {
         match plan {
             LogicalPlan::Unnest(unnest) => Ok(Some((unnest, plan))),
@@ -1320,7 +1323,11 @@ impl Unparser<'_> {
                         value: self.expr_to_sql(skip)?,
                     }));
                 }
-                self.peel_to_unnest_with_modifiers(limit.input.as_ref(), query)
+                self.peel_to_unnest_with_modifiers(
+                    limit.input.as_ref(),
+                    query,
+                    flatten_alias,
+                )
             }
             LogicalPlan::Sort(sort) => {
                 let Some(query_ref) = query.as_mut() else {
@@ -1334,8 +1341,39 @@ impl Unparser<'_> {
                         false,
                     ))));
                 }
-                query_ref.order_by(self.sorts_to_sql(&sort.expr)?);
-                self.peel_to_unnest_with_modifiers(sort.input.as_ref(), query)
+                // When a flatten_alias is provided, rewrite
+                // __unnest_placeholder(...) columns in sort expressions to
+                // alias.VALUE so ORDER BY references the FLATTEN output.
+                let unnest_node = match sort.input.as_ref() {
+                    LogicalPlan::Unnest(u) => Some(u),
+                    _ => find_unnest_node_within_select(sort.input.as_ref()),
+                };
+                let sort_exprs = if let Some(alias) = flatten_alias
+                    && let Some(unnest) = unnest_node
+                {
+                    sort.expr
+                        .iter()
+                        .map(|s| {
+                            let rewritten = unproject_unnest_expr_as_flatten_value(
+                                s.expr.clone(),
+                                unnest,
+                                alias,
+                            )?;
+                            Ok(SortExpr {
+                                expr: rewritten,
+                                ..s.clone()
+                            })
+                        })
+                        .collect::<Result<Vec<_>>>()?
+                } else {
+                    sort.expr.clone()
+                };
+                query_ref.order_by(self.sorts_to_sql(&sort_exprs)?);
+                self.peel_to_unnest_with_modifiers(
+                    sort.input.as_ref(),
+                    query,
+                    flatten_alias,
+                )
             }
             _ => Ok(None),
         }
