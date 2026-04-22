@@ -288,10 +288,10 @@ pub(super) fn rewrite_plan_for_sort_on_non_projected_fields(
                 while let Expr::Alias(alias) = expr {
                     expr = *alias.expr;
                 }
-                if let Expr::Column(ref col) = expr {
-                    if let Some(underlying) = dropped_aliases.get(col.name()) {
-                        sort_expr.expr = underlying.clone();
-                    }
+                if let Expr::Column(ref col) = expr
+                    && let Some(underlying) = dropped_aliases.get(col.name())
+                {
+                    sort_expr.expr = underlying.clone();
                 }
             }
         }
