@@ -612,71 +612,78 @@ impl Unparser<'_> {
                 let found_agg = self.reconstruct_select_statement(plan, p, select)?;
 
                 // If the Projection claimed an Aggregate by reaching through
-                // a Limit or Sort, fold those clauses into the current query
-                // and skip the node during recursion. Otherwise the Limit/Sort
-                // arm would see `already_projected` and wrap everything in a
-                // spurious derived subquery.
+                // one or more Limit / Sort nodes, fold their clauses into the
+                // current query and skip those nodes during recursion.
+                // Otherwise the Limit/Sort arm would see `already_projected`
+                // and wrap everything in a spurious derived subquery, emitting
+                // the aggregate twice.
+                //
+                // Handles arbitrary stacks of Limit/Sort (e.g. Projection →
+                // Limit → Sort → Aggregate) by peeling nodes in a loop until
+                // we reach something other than a Limit or Sort. Each clause
+                // is folded at most once; if a second Limit or Sort is
+                // encountered, the loop stops and normal recursion resumes.
                 if found_agg {
-                    if let LogicalPlan::Limit(limit) = p.input.as_ref() {
-                        if let Some(fetch) = &limit.fetch {
-                            let Some(query) = query.as_mut() else {
-                                return internal_err!(
-                                    "Limit operator only valid in a statement context."
+                    let mut cur = p.input.as_ref();
+                    let mut have_limit = false;
+                    let mut have_order_by = false;
+                    loop {
+                        match cur {
+                            LogicalPlan::Limit(limit) if !have_limit => {
+                                let Some(query_ref) = query.as_mut() else {
+                                    return internal_err!(
+                                        "Limit operator only valid in a statement context."
+                                    );
+                                };
+                                if let Some(fetch) = &limit.fetch {
+                                    query_ref.limit(Some(self.expr_to_sql(fetch)?));
+                                }
+                                if let Some(skip) = &limit.skip {
+                                    query_ref.offset(Some(ast::Offset {
+                                        rows: ast::OffsetRows::None,
+                                        value: self.expr_to_sql(skip)?,
+                                    }));
+                                }
+                                have_limit = true;
+                                cur = limit.input.as_ref();
+                            }
+                            LogicalPlan::Sort(sort) if !have_order_by => {
+                                let Some(query_ref) = query.as_mut() else {
+                                    return internal_err!(
+                                        "Sort operator only valid in a statement context."
+                                    );
+                                };
+                                if let Some(fetch) = sort.fetch
+                                    && !have_limit
+                                {
+                                    query_ref.limit(Some(ast::Expr::value(
+                                        ast::Value::Number(fetch.to_string(), false),
+                                    )));
+                                    have_limit = true;
+                                }
+                                let agg = find_agg_node_within_select(
+                                    plan,
+                                    select.already_projected(),
                                 );
-                            };
-                            query.limit(Some(self.expr_to_sql(fetch)?));
+                                let sort_exprs: Vec<SortExpr> = sort
+                                    .expr
+                                    .iter()
+                                    .map(|sort_expr| {
+                                        unproject_sort_expr(
+                                            sort_expr.clone(),
+                                            agg,
+                                            sort.input.as_ref(),
+                                        )
+                                    })
+                                    .collect::<Result<Vec<_>>>()?;
+                                query_ref.order_by(self.sorts_to_sql(&sort_exprs)?);
+                                have_order_by = true;
+                                cur = sort.input.as_ref();
+                            }
+                            _ => break,
                         }
-                        if let Some(skip) = &limit.skip {
-                            let Some(query) = query.as_mut() else {
-                                return internal_err!(
-                                    "Offset operator only valid in a statement context."
-                                );
-                            };
-                            query.offset(Some(ast::Offset {
-                                rows: ast::OffsetRows::None,
-                                value: self.expr_to_sql(skip)?,
-                            }));
-                        }
-                        return self.select_to_sql_recursively(
-                            limit.input.as_ref(),
-                            query,
-                            select,
-                            relation,
-                        );
                     }
-                    if let LogicalPlan::Sort(sort) = p.input.as_ref() {
-                        let Some(query_ref) = query.as_mut() else {
-                            return internal_err!(
-                                "Sort operator only valid in a statement context."
-                            );
-                        };
-                        if let Some(fetch) = sort.fetch {
-                            query_ref.limit(Some(ast::Expr::value(ast::Value::Number(
-                                fetch.to_string(),
-                                false,
-                            ))));
-                        }
-                        let agg =
-                            find_agg_node_within_select(plan, select.already_projected());
-                        let sort_exprs: Vec<SortExpr> = sort
-                            .expr
-                            .iter()
-                            .map(|sort_expr| {
-                                unproject_sort_expr(
-                                    sort_expr.clone(),
-                                    agg,
-                                    sort.input.as_ref(),
-                                )
-                            })
-                            .collect::<Result<Vec<_>>>()?;
-                        query_ref.order_by(self.sorts_to_sql(&sort_exprs)?);
-                        return self.select_to_sql_recursively(
-                            sort.input.as_ref(),
-                            query,
-                            select,
-                            relation,
-                        );
-                    }
+                    return self.select_to_sql_recursively(cur, query, select, relation);
                 }
 
                 self.select_to_sql_recursively(p.input.as_ref(), query, select, relation)
